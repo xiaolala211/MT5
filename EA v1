@@ -276,7 +276,7 @@ double dailyPnL = 0;
 double startingEquity = 0;
 bool lastBarTraded = false;
 int orderCount = 0;
-
+double rates[];  // Dynamic array declaration
 PriceZone active_HTF_POI_Zone;
 
 //+------------------------------------------------------------------+
@@ -830,7 +830,7 @@ void SendTradeNotification(string direction, double entry, double sl, double tp,
     string message = StringFormat("%s %s: Entry=%.5f, SL=%.5f, TP=%.5f, Lots=%.2f, Score=%.1f",
                                   _Symbol, direction, entry, sl, tp, lots, score);
     
-    if(TerminalInfoInteger(TERMINAL_NOTIFICATIONS)) {
+   if((bool)TerminalInfoInteger(TERMINAL_NOTIFICATIONS_ENABLED)) {
         SendNotification(message);
     }
     
@@ -1001,15 +1001,16 @@ PriceZone FindBearishFVG(ENUM_TIMEFRAMES timeframe, int fvg_lookback_period, dou
     MqlRates rates[];
     ArraySetAsSeries(rates, true);
 
-    int rates_to_copy = fvg_lookback_period + 3 + shift; 
+    int rates_to_copy = fvg_lookback_period + 3 + shift;
     if (CopyRates(_Symbol, timeframe, shift, rates_to_copy, rates) < rates_to_copy) {
-        PrintFormat("Error copying rates for Bearish FVG detection on %s: %d", EnumToString(timeframe), GetLastError());
+        PrintFormat("Error copying rates for Bearish FVG detection on %s: %d", 
+                   EnumToString(timeframe), GetLastError());
         return fvg;
     }
 
     for (int i = 0; i < fvg_lookback_period; i++) {
         if (i + 2 >= ArraySize(rates)) {
-            break; 
+            break;
         }
 
         MqlRates candle3 = rates[i];
@@ -1340,6 +1341,7 @@ int FindSwingHigh(ENUM_TIMEFRAMES timeframe, int lookback) {
 //| Update Market Analysis                                           |
 //+------------------------------------------------------------------+
 void UpdateMarketAnalysis() {
+
     // Multi-timeframe bias analysis
     ENUM_BIAS etfBias = AnalyzeTimeframeBias(PERIOD_CURRENT);
     ENUM_BIAS htf1Bias = AnalyzeTimeframeBias(HTF_Primary);
