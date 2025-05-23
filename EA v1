@@ -1,0 +1,1923 @@
+//+------------------------------------------------------------------+
+//|                                        SMC_ExpertAdvisor.mq5     |
+//|                        Smart Money Concepts Trading System       |
+//|                                                                  |
+//| Description: Expert Advisor implementing Smart Money Concepts    |
+//| trading strategy with multi-timeframe analysis.                  |
+//+------------------------------------------------------------------+
+#property copyright "Copyright 2023"
+#property link      ""
+#property version   "1.00"
+#property strict
+
+// Include MQL5 Trade library
+#include <Trade\Trade.mqh>
+#include <Trade\PositionInfo.mqh>
+//+------------------------------------------------------------------+
+//| Struct to store Price Range info for patterns like OB, FVG     |
+//+------------------------------------------------------------------+
+struct PriceZone {
+    double high;
+    double low;
+    int    bar_index;
+    bool   isValid;
+
+    void PriceZone() { // Constructor
+        Reset();
+    }
+
+    void Reset() {
+        high = 0;
+        low = 0;
+        bar_index = -1;
+        isValid = false;
+    }
+};
+//+------------------------------------------------------------------+
+// ENUM DEFINITIONS
+//+------------------------------------------------------------------+
+
+// Trading bias enumeration
+enum ENUM_BIAS {
+   BIAS_NEUTRAL,    // Neutral bias (no clear direction)
+   BIAS_BULLISH,    // Bullish bias (expecting price to rise)
+   BIAS_BEARISH     // Bearish bias (expecting price to fall)
+};
+enum ENUM_HTF_REACTION_CONTEXT {
+    HTF_POI_NONE,           // Không có tương tác đặc biệt với POI của HTF
+    HTF_POI_IN_BULLISH_OB,  // Giá ETF đang ở trong Bullish OB của HTF
+    HTF_POI_IN_BEARISH_OB,  // Giá ETF đang ở trong Bearish OB của HTF
+    HTF_POI_IN_BULLISH_FVG, // Giá ETF đang ở trong Bullish FVG của HTF
+    HTF_POI_IN_BEARISH_FVG  // Giá ETF đang ở trong Bearish FVG của HTF
+};
+PriceZone FindBullishOrderBlock(ENUM_TIMEFRAMES timeframe, int ob_lookback_period, double min_move_factor, int min_impulse_candles, int shift = 1);
+PriceZone FindBearishOrderBlock(ENUM_TIMEFRAMES timeframe, int ob_lookback_period, double min_move_factor, int min_impulse_candles, int shift = 1);
+PriceZone FindBullishFVG(ENUM_TIMEFRAMES timeframe, int fvg_lookback_period, double min_fvg_size_points, int shift = 1);
+PriceZone FindBearishFVG(ENUM_TIMEFRAMES timeframe, int fvg_lookback_period, double min_fvg_size_points, int shift = 1);
+PriceZone GetLastSignificantSwingHigh(ENUM_TIMEFRAMES timeframe, int lookback_range, int N, int shift_start = 1);
+PriceZone GetLastSignificantSwingLow(ENUM_TIMEFRAMES timeframe, int lookback_range, int N, int shift_start = 1);
+bool CheckForBullishBOS(ENUM_TIMEFRAMES timeframe, const PriceZone &prev_swing_high, int confirmation_shift = 1);
+bool CheckForBearishBOS(ENUM_TIMEFRAMES timeframe, const PriceZone &prev_swing_low, int confirmation_shift = 1);
+bool IsBullishCHoCH(ENUM_TIMEFRAMES timeframe, int swing_lookback, int N_structural_bars, int confirmation_shift, PriceZone &choch_level_broken); // Dòng mới
+bool IsBearishCHoCH(ENUM_TIMEFRAMES timeframe, int swing_lookback, int N_structural_bars, int confirmation_shift, PriceZone &choch_level_broken); // Dòng mới
+// Trả về true nếu có sweep, và sweep_candle_info sẽ chứa thông tin nến sweep
+bool CheckAndGetBullishLiquiditySweep(ENUM_TIMEFRAMES timeframe, const PriceZone &prev_swing_low,
+                                     double min_spike_points, int max_close_back_candles,
+                                     PriceZone &sweep_candle_info, int check_bar_shift = 1);
+
+bool CheckAndGetBearishLiquiditySweep(ENUM_TIMEFRAMES timeframe, const PriceZone &prev_swing_high,
+                                     double min_spike_points, int max_close_back_candles,
+                                     PriceZone &sweep_candle_info, int check_bar_shift = 1);
+void DrawLiquiditySweepMarker(ENUM_TIMEFRAMES timeframe, const PriceZone &sweep_candle_info, const PriceZone &swept_level_info, bool is_bullish_sweep, color sweep_color, int arrow_code);
+void ExecuteBuySetup(const PriceZone &currentBullishOB, const PriceZone &currentBullishFVG,
+                     const PriceZone &bullishSweepInfo, bool wasBullishSweep,
+                     bool wasBullishBOS, const PriceZone &bullishCHoCHLevelBroken, bool wasBullishCHoCH,
+                     const PriceZone &lastSignificantHighOnETF, const PriceZone &lastSignificantLowOnETF,
+                     ENUM_HTF_REACTION_CONTEXT htfContext, 
+                     const PriceZone &activeHTF_POI); 
+void ExecuteSellSetup(const PriceZone &currentBearishOB, const PriceZone &currentBearishFVG,
+                      const PriceZone &bearishSweepInfo, bool wasBearishSweep,
+                      bool wasBearishBOS, const PriceZone &bearishCHoCHLevelBroken, bool wasBearishCHoCH,
+                      const PriceZone &lastSignificantHighOnETF, const PriceZone &lastSignificantLowOnETF,
+                      ENUM_HTF_REACTION_CONTEXT htfContext,
+                      const PriceZone &activeHTF_POI); // <<<<<<<<<<<<<<<<<<<<<<<< THAM SỐ MỚI
+void DetermineMarketBias(ENUM_TIMEFRAMES higherTimeframe,
+                         const PriceZone &etfBullishOB, const PriceZone &etfBearishOB,
+                         const PriceZone &etfBullishFVG, const PriceZone &etfBearishFVG);
+
+
+//+------------------------------------------------------------------+
+// INPUT PARAMETERS
+//+------------------------------------------------------------------+
+
+// General settings
+input group "General Settings"
+input bool   EnableTrading = true;          // Enable automatic trading
+input double RiskPercentage = 1.0;          // Risk per trade (% of balance)
+input int    MaxOpenTrades = 3;             // Maximum number of open trades
+input group "Trade Management - Break-Even"
+input bool   UseBreakEven         = true;     // Bật/Tắt tính năng tự động dời SL về hòa vốn
+input double BE_Trigger_RR        = 1.0;      // Tỷ lệ R:R để kích hoạt Break-Even (ví dụ: 1.0 = khi lợi nhuận đạt 1R)
+input int    BE_Plus_Pips         = 20;       // Số Pip cộng thêm vào điểm vào lệnh khi đặt SL hòa vốn (để bù phí, slippage)
+                                              // (ví dụ: 20 points = 2 pips cho cặp 5 số)
+// Strategy settings
+input group "Strategy Settings"
+input bool   TradeBullish = true;           // Take bullish trades
+input bool   TradeBearish = true;           // Take bearish trades
+input bool   AllowTradingNeutralBias = true; // Allow trading with neutral bias
+input ENUM_TIMEFRAMES HTF_BiasPeriod = PERIOD_H4; // Khung thời gian cao hơn để xác định xu hướng chính
+// Trade management
+input group "Trade Management"
+input bool   UsePartialTakeProfit = true;   // Enable partial TP
+input double PartialTPPercent = 50.0;       // Percentage of position to close at TP1
+input double RRRatio = 2.0;                 // Risk:Reward Ratio for TP2
+input int    SL_BufferPoints = 100; // Số Point dùng làm vùng đệm cho Stop Loss (ví dụ: 100 points = 10 pips cho cặp 5 số)
+// Advanced settings
+input group "Advanced Settings"
+input int    SwingLookback = 10;            // Bars to lookback for swing points
+input int    MinStopDistancePoints = 200;   // Minimum stop distance in points
+input int    MA_Fast_Period = 50;           // Fast MA period
+input int    MA_Slow_Period = 200;          // Slow MA period
+input int    StructuralSwingMinBars = 3;   // Số nến tối thiểu ở mỗi bên để xác định một swing quan trọng (ví dụ: 2 hoặc 3)
+input int    BOS_CHoCH_MinBreakPoints = 50; // Số Point tối thiểu mà giá phải phá qua mức swing để BOS/CHoCH hợp lệ (ví dụ 50 points = 5 pips cho cặp 5 số)
+// Input parameters for Order Block detection
+input group "SMC Pattern Detection - Order Blocks"
+input bool UseOrderBlocks = true;                // Enable/Disable Order Block detection
+input int  OrderBlockLookbackPeriod = 30;      // Số nến quét ngược để tìm OB
+input double MinMoveAfterOBFactor = 1.5;       // Hệ số tối thiểu cho nến sau OB (ví dụ: thân nến sau OB >= 1.5 * thân nến OB)
+                                               // Hoặc là khoảng cách di chuyển tối thiểu tính bằng point
+input int MinImpulseCandles = 1;               // Số nến tối thiểu tạo thành động lượng sau OB
+// Input parameters for drawing Order Blocks
+input group "SMC Visuals - Order Blocks"
+input bool   Draw_OrderBlocks     = true;           // Bật/Tắt vẽ Order Blocks
+input color  Bullish_OB_Color     = clrDeepSkyBlue; // Màu cho Bullish Order Blocks
+input color  Bearish_OB_Color     = clrLightCoral;  // Màu cho Bearish Order Blocks
+input ENUM_LINE_STYLE OB_Style    = STYLE_SOLID;    // Kiểu đường viền cho OB
+input int    OB_Width             = 1;              // Độ dày đường viền OB
+input bool   OB_Fill              = true;           // Tô màu nền cho OB
+input int    OB_Extend_Bars       = 10;             // Số nến kéo dài hình vẽ OB về phía tương lai
+input group "SMC Pattern Detection - FVGs"
+input bool   UseFairValueGaps       = true;     // Bật/Tắt phát hiện FVG
+input int    FVGLookbackPeriod      = 30;       // Số nến quét ngược để tìm FVG
+input double MinFVGSizePoints       = 50;       // Kích thước FVG tối thiểu tính bằng Point (0 = không lọc)
+
+// Input parameters for drawing Fair Value Gaps (BẠN CÓ THỂ ĐÃ CÓ PHẦN NÀY RỒI, KIỂM TRA LẠI)
+input group "SMC Visuals - FVGs"
+input bool   Draw_FairValueGaps     = true;           // Bật/Tắt vẽ FVG
+input color  Bullish_FVG_Color      = clrLightSkyBlue; // Màu cho Bullish FVG
+input color  Bearish_FVG_Color      = clrPink;        // Màu cho Bearish FVG
+input ENUM_LINE_STYLE FVG_Style     = STYLE_DOT;      // Kiểu đường viền cho FVG
+input int    FVG_Width              = 1;              // Độ dày đường viền FVG
+input bool   FVG_Fill               = true;           // Tô màu nền cho FVG
+input int    FVG_Extend_Bars        = 15;             // Số nến kéo dài hình vẽ FVG về phía tương lai
+input group "SMC Pattern Detection - Liquidity Sweeps"
+input bool   UseLiquiditySweeps          = true;    // Bật/Tắt phát hiện Liquidity Sweeps
+input double SweepMinSpikePoints         = 10;      // Số point tối thiểu mà râu nến phải vượt qua mức swing để được coi là sweep (0 = không dùng)
+input int    SweepCloseBackCandles       = 1;       // Số nến tối đa (kể từ nến sweep) để giá đóng cửa trở lại bên trong vùng swing
+                                                   // Ví dụ: 1 = nến sweep phải đóng cửa lại, 2 = nến sweep hoặc nến ngay sau nó
+
+input group "SMC Visuals - Liquidity Sweeps"
+input bool   Draw_LiquiditySweeps        = true;    // Bật/Tắt vẽ Liquidity Sweeps
+input color  Bullish_LS_Color            = clrChartreuse; // Màu cho Bullish Liquidity Sweep
+input color  Bearish_LS_Color            = clrOrangeRed;  // Màu cho Bearish Liquidity Sweep
+input int    ArrowBullishSweepCode     = 241;     // Mã cho SYMBOL_ARROWUP (font Wingdings)
+input int    ArrowBearishSweepCode     = 242;     // Mã cho SYMBOL_ARROWDOWN (font Wingdings)
+input group "Entry Confirmation Factors (Confluence)"
+input bool C_Entry_Require_OB_Touch         = true;    // [OB] Giá có chạm vào/đi vào vùng OB gần nhất không?
+input bool C_Entry_Require_FVG_Mitigation   = false;   // [FVG] Giá có lấp đầy một phần FVG gần nhất không?
+input bool C_Entry_Require_Sweep_Occurred   = false;   // [LS] Một Liquidity Sweep cùng chiều vừa xảy ra?
+input bool C_Entry_Require_BOS_Confirmation = true;    // [BOS] Một BOS cùng chiều xu hướng bias vừa xảy ra?
+input bool C_Entry_Require_CHoCH_Signal     = true;    // [CHoCH] Một CHoCH (cho tín hiệu đảo chiều hoặc xác nhận sớm) vừa xảy ra?
+
+// Các điều kiện chi tiết hơn có thể thêm sau, ví dụ:
+// input bool C_Entry_OB_MustBeUnmitigated   = true;    // OB phải chưa bị chạm tới nhiều lần
+// input bool C_Entry_Retest_After_BOS_CHoCH = false;   // Chờ giá retest một POI sau khi có BOS/CHoCH
+input ENUM_TIMEFRAMES C_Entry_Confirmation_TF = PERIOD_CURRENT; // Khung thời gian để check các xác nhận này (mặc định là hiện tại)
+//+------------------------------------------------------------------+
+// GLOBAL VARIABLES
+//+------------------------------------------------------------------+
+ulong ea_magic_number = 123456;
+ENUM_HTF_REACTION_CONTEXT currentHTF_POI_Context = HTF_POI_NONE;
+PriceZone active_HTF_POI_Zone; // Lưu thông tin (H, L, index) của POI trên HTF đang có tương tác
+// Global objects
+CTrade trade;                    // Trade object for order execution
+CPositionInfo positionInfo;      // Position info object
+
+// State variables
+ENUM_BIAS currentBias = BIAS_NEUTRAL;
+bool lastBarTraded = false;      // Flag to prevent trading on the same bar
+datetime lastBarTime = 0;        // Time of the last processed bar
+int orderCount = 0;              // Track number of open orders
+int maFastHandle, maSlowHandle;  // MA indicator handles
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+
+int OnInit() {
+   // Log initialization
+   Print("Smart Money Concepts Expert Advisor initializing");
+   
+   // Initialize MA indicators
+   maFastHandle = iMA(_Symbol, PERIOD_CURRENT, MA_Fast_Period, 0, MODE_SMA, PRICE_CLOSE);
+   maSlowHandle = iMA(_Symbol, PERIOD_CURRENT, MA_Slow_Period, 0, MODE_SMA, PRICE_CLOSE);
+   
+   if (maFastHandle == INVALID_HANDLE || maSlowHandle == INVALID_HANDLE) {
+      Print("Error initializing MA indicators. Error code: ", GetLastError());
+      return INIT_FAILED;
+   }
+   
+   // Set magic number for trade object
+  trade.SetExpertMagicNumber(ea_magic_number);
+   
+   // Seed the current bias with a simple analysis
+
+   
+   Print("Smart Money Concepts Expert Advisor initialized successfully");
+   return INIT_SUCCEEDED;
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization function                                 |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason) {
+   // Release indicator handles
+   if (maFastHandle != INVALID_HANDLE) IndicatorRelease(maFastHandle);
+   if (maSlowHandle != INVALID_HANDLE) IndicatorRelease(maSlowHandle);
+  if(reason != REASON_CHARTCHANGE && reason != REASON_TEMPLATE) // Chỉ xóa khi deinit thực sự, không phải khi đổi chart/template
+    {
+      DeleteObjectsByPrefix("SMC_BullishOB_");
+      DeleteObjectsByPrefix("SMC_BearishOB_");
+      DeleteObjectsByPrefix("SMC_BullishFVG_");
+      DeleteObjectsByPrefix("SMC_BearishFVG_");
+      DeleteObjectsByPrefix("SMC_LS_Bull_");
+      DeleteObjectsByPrefix("SMC_LS_Bear_");
+    } 
+   Print("Expert Advisor deinitialized. Reason code: ", reason);
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick() {
+   // Skip processing if trading is disabled
+   if (!EnableTrading) return;
+   
+   // Get current bar time
+   datetime currentBarTime = iTime(_Symbol, PERIOD_CURRENT, 0);
+   
+   // Check if we're on a new bar
+   bool isNewBar = (currentBarTime != lastBarTime);
+   
+   // Update last bar time
+   if (isNewBar) {
+      lastBarTime = currentBarTime;
+      lastBarTraded = false;
+      Print("New bar detected, resetting trade flag");
+   }
+   
+   // Manage existing open trades
+   ManageOpenTrades();
+   
+   // If already have maximum trades, exit
+   if (orderCount >= MaxOpenTrades) {
+      return;
+   }
+   
+   // Analyze market conditions and look for trading opportunities if not already traded on this bar
+   if (!lastBarTraded) {
+      AnalyzeAndTrade();
+      lastBarTraded = true;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Manage existing trades (Break-Even, future Partial TP, Trailing SL etc.)|
+//+------------------------------------------------------------------+
+void ManageOpenTrades() {
+    orderCount = 0; 
+
+    for (int i = PositionsTotal() - 1; i >= 0; i--) {
+        if (!positionInfo.SelectByIndex(i)) {
+            PrintFormat("ManageOpenTrades: Error selecting position by index %d, Error: %d", i, GetLastError());
+            continue;
+        }
+
+        // Chỉ quản lý các lệnh của EA này và trên symbol hiện tại
+if (positionInfo.Symbol() == _Symbol && positionInfo.Magic() == ea_magic_number) {
+
+            orderCount++;
+
+            // --- Logic Break-Even ---
+            if (UseBreakEven && positionInfo.StopLoss() != 0.0) { // Chỉ áp dụng BE nếu có SL ban đầu và tính năng được bật
+                ulong ticket = positionInfo.Ticket(); // Sử dụng ulong
+
+                double openPrice = positionInfo.PriceOpen();
+                double currentSL = positionInfo.StopLoss();
+                double currentTP = positionInfo.TakeProfit(); // Giữ nguyên TP hiện tại
+                ENUM_POSITION_TYPE positionType = positionInfo.PositionType();
+                double point = _Point;
+                double stoplevelDistance = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * point; // Khoảng cách StopLevel tính bằng giá
+
+                // 1. Tính toán giá SL mục tiêu cho Break-Even (bao gồm BE_Plus_Pips)
+                double targetBESLPrice = 0;
+                if (positionType == POSITION_TYPE_BUY) {
+                    targetBESLPrice = openPrice + BE_Plus_Pips * point;
+                } else { // POSITION_TYPE_SELL
+                    targetBESLPrice = openPrice - BE_Plus_Pips * point;
+                }
+
+                // 2. Kiểm tra xem SL hiện tại có còn là SL lỗ ban đầu không
+                //    và SL đã được dời về mức BE mục tiêu (hoặc tốt hơn) chưa.
+                bool isInitialLossSL = false;
+                if (positionType == POSITION_TYPE_BUY && currentSL < openPrice) {
+                    isInitialLossSL = true;
+                } else if (positionType == POSITION_TYPE_SELL && currentSL > openPrice) {
+                    isInitialLossSL = true;
+                }
+
+                bool isAlreadyEffectivelyBE = false;
+                double tolerance = point * 2; // Dung sai nhỏ để so sánh giá SL
+                if (positionType == POSITION_TYPE_BUY) {
+                    if (currentSL >= targetBESLPrice - tolerance) isAlreadyEffectivelyBE = true;
+                } else { // POSITION_TYPE_SELL
+                    if (currentSL <= targetBESLPrice + tolerance) isAlreadyEffectivelyBE = true;
+                }
+                
+                // Nếu SL không còn là SL lỗ ban đầu (ví dụ đã được dời lên hòa vốn hoặc trailing rồi)
+                // HOẶC nếu SL đã ở mức BE mục tiêu rồi, thì bỏ qua
+                if (!isInitialLossSL || isAlreadyEffectivelyBE) {
+                    // Optional: Print a message if you want to know it skipped due to SL already moved from loss
+                    // if (!isInitialLossSL && !isAlreadyEffectivelyBE) {
+                    //    PrintFormat("Ticket #%d: SL (%G) already modified from initial loss state or BE already applied. Target BE SL: %G. Skipping BE.", ticket, currentSL, targetBESLPrice);
+                    // }
+                    continue; // Chuyển sang lệnh tiếp theo
+                }
+
+                // 3. Nếu SL vẫn là SL lỗ ban đầu và chưa đạt BE mục tiêu,
+                //    tính toán rủi ro ban đầu và kiểm tra điều kiện lợi nhuận để kích hoạt BE
+                double initialRiskPriceDistance = MathAbs(openPrice - currentSL); // Giả định currentSL là SL ban đầu
+
+                if (initialRiskPriceDistance > stoplevelDistance + point) { // Đảm bảo rủi ro ban đầu có ý nghĩa
+                    double profitTargetForBE_InPriceDistance = initialRiskPriceDistance * BE_Trigger_RR;
+                    bool profitConditionMet = false;
+                    double currentMarketPriceForCheck = 0;
+
+                    if (positionType == POSITION_TYPE_BUY) {
+                        currentMarketPriceForCheck = SymbolInfoDouble(_Symbol, SYMBOL_BID); // Dùng Bid để kiểm tra lợi nhuận lệnh Buy
+                        if (currentMarketPriceForCheck >= openPrice + profitTargetForBE_InPriceDistance) {
+                            profitConditionMet = true;
+                        }
+                    } else { // POSITION_TYPE_SELL
+                        currentMarketPriceForCheck = SymbolInfoDouble(_Symbol, SYMBOL_ASK); // Dùng Ask để kiểm tra lợi nhuận lệnh Sell
+                        if (currentMarketPriceForCheck <= openPrice - profitTargetForBE_InPriceDistance) {
+                            profitConditionMet = true;
+                        }
+                    }
+
+                    if (profitConditionMet) {
+                        // 4. Kiểm tra xem targetBESLPrice mới có hợp lệ so với giá thị trường và stoplevel không
+                        bool newSLIsValid = false;
+                        if (positionType == POSITION_TYPE_BUY) {
+                            // Với lệnh Buy, SL mới phải thấp hơn giá Bid hiện tại một khoảng stoplevelDistance
+                            if (targetBESLPrice < SymbolInfoDouble(_Symbol, SYMBOL_BID) - stoplevelDistance) {
+                                newSLIsValid = true;
+                            }
+                        } else { // POSITION_TYPE_SELL
+                            // Với lệnh Sell, SL mới phải cao hơn giá Ask hiện tại một khoảng stoplevelDistance
+                            if (targetBESLPrice > SymbolInfoDouble(_Symbol, SYMBOL_ASK) + stoplevelDistance) {
+                                newSLIsValid = true;
+                            }
+                        }
+
+                        if (newSLIsValid) {
+                            PrintFormat("Ticket #%d: BE Triggered. Profit reached for %G R. Moving SL from %G to %G.",
+                                        ticket, BE_Trigger_RR, currentSL, targetBESLPrice);
+                            if (trade.PositionModify(ticket, targetBESLPrice, currentTP)) {
+                                PrintFormat("Ticket #%d: SL successfully moved to BreakEven %G.", ticket, targetBESLPrice);
+                            } else {
+                                PrintFormat("Ticket #%d: Failed to modify SL for BreakEven. Error: '%s' (Code: %d). Target SL: %G, Market Bid: %G, Market Ask: %G, StopLevelDist: %G pts",
+                                            ticket, trade.ResultComment(), trade.ResultRetcode(), targetBESLPrice, 
+                                            SymbolInfoDouble(_Symbol, SYMBOL_BID), SymbolInfoDouble(_Symbol, SYMBOL_ASK), stoplevelDistance/point);
+                            }
+                        } else {
+                            PrintFormat("Ticket #%d: BE Triggered, but new BE SL (%G) is too close to current market or violates stoplevel (%G pts). SL modification skipped.",
+                                        ticket, targetBESLPrice, stoplevelDistance/point);
+                        }
+                    }
+                } else {
+                    // Rủi ro ban đầu quá nhỏ hoặc SL không ở trạng thái lỗ để tính toán BE dựa trên RR
+                    // PrintFormat("Ticket #%d: Initial risk distance (%.1f pts) too small or SL not in initial loss state for BE RR calc.", ticket, initialRiskPriceDistance/point);
+                }
+            } // Kết thúc if (UseBreakEven ...)
+            // ... (Các logic quản lý lệnh khác như Partial TP, Trailing SL sẽ được thêm vào đây sau) ...
+        } // Kết thúc if (positionInfo.Symbol() == _Symbol && ...)
+    } // Kết thúc for loop
+}
+
+//+------------------------------------------------------------------+
+//| Analyze market and execute trades                                |
+//+------------------------------------------------------------------+
+void AnalyzeAndTrade() {
+    // --- 0. Xóa các đối tượng vẽ cũ ---
+    if (Draw_OrderBlocks) { DeleteObjectsByPrefix("SMC_BullishOB_"); DeleteObjectsByPrefix("SMC_BearishOB_"); }
+    if (Draw_FairValueGaps) { DeleteObjectsByPrefix("SMC_BullishFVG_"); DeleteObjectsByPrefix("SMC_BearishFVG_"); }
+    if (Draw_LiquiditySweeps) { DeleteObjectsByPrefix("SMC_LS_Bull_"); DeleteObjectsByPrefix("SMC_LS_Bear_"); }
+    // TODO: Thêm xóa cho đối tượng vẽ BOS, CHoCH nếu có sau này
+
+    // --- 1. Thu thập thông tin SMC trên Khung Thời Gian Hiện Tại (ETF) ---
+    PriceZone etfBullishOB, etfBearishOB, etfBullishFVG, etfBearishFVG;
+    PriceZone etfLastSigHigh, etfLastSigLow;
+    PriceZone etfBullishCHoCHLevel, etfBearishCHoCHLevel;
+    PriceZone etfBullishSweepInfo, etfBearishSweepInfo;
+    bool etfWasBullishBOS = false, etfWasBearishBOS = false;
+    bool etfWasBullishCHoCH = false, etfWasBearishCHoCH = false;
+    bool etfWasBullishSweep = false, etfWasBearishSweep = false;
+
+    // Tìm OBs
+    if (UseOrderBlocks) {
+        etfBullishOB = FindBullishOrderBlock(PERIOD_CURRENT, OrderBlockLookbackPeriod, MinMoveAfterOBFactor, MinImpulseCandles);
+        if (etfBullishOB.isValid && Draw_OrderBlocks) DrawOrderBlock(etfBullishOB, Bullish_OB_Color, "SMC_BullishOB", PERIOD_CURRENT, OB_Style, OB_Width, OB_Fill, OB_Extend_Bars);
+        
+        etfBearishOB = FindBearishOrderBlock(PERIOD_CURRENT, OrderBlockLookbackPeriod, MinMoveAfterOBFactor, MinImpulseCandles);
+        if (etfBearishOB.isValid && Draw_OrderBlocks) DrawOrderBlock(etfBearishOB, Bearish_OB_Color, "SMC_BearishOB", PERIOD_CURRENT, OB_Style, OB_Width, OB_Fill, OB_Extend_Bars);
+    }
+
+    // Tìm FVGs
+    if (UseFairValueGaps) {
+        etfBullishFVG = FindBullishFVG(PERIOD_CURRENT, FVGLookbackPeriod, MinFVGSizePoints);
+        if (etfBullishFVG.isValid && Draw_FairValueGaps) DrawFairValueGap(etfBullishFVG, Bullish_FVG_Color, "SMC_BullishFVG", PERIOD_CURRENT, FVG_Style, FVG_Width, FVG_Fill, FVG_Extend_Bars);
+
+        etfBearishFVG = FindBearishFVG(PERIOD_CURRENT, FVGLookbackPeriod, MinFVGSizePoints);
+        if (etfBearishFVG.isValid && Draw_FairValueGaps) DrawFairValueGap(etfBearishFVG, Bearish_FVG_Color, "SMC_BearishFVG", PERIOD_CURRENT, FVG_Style, FVG_Width, FVG_Fill, FVG_Extend_Bars);
+    }
+
+    // Tìm Significant Swings (cần cho BOS, CHoCH, Sweeps)
+    etfLastSigHigh = GetLastSignificantSwingHigh(PERIOD_CURRENT, SwingLookback, StructuralSwingMinBars);
+    etfLastSigLow  = GetLastSignificantSwingLow(PERIOD_CURRENT, SwingLookback, StructuralSwingMinBars);
+    // (Tùy chọn vẽ các swing này)
+
+    // Kiểm tra BOS
+    if (etfLastSigHigh.isValid && CheckForBullishBOS(PERIOD_CURRENT, etfLastSigHigh, 1)) etfWasBullishBOS = true;
+    if (etfLastSigLow.isValid && CheckForBearishBOS(PERIOD_CURRENT, etfLastSigLow, 1)) etfWasBearishBOS = true;
+    // (Tùy chọn vẽ BOS)
+
+    // Kiểm tra CHoCH
+    if (IsBullishCHoCH(PERIOD_CURRENT, SwingLookback, StructuralSwingMinBars, 1, etfBullishCHoCHLevel)) etfWasBullishCHoCH = true;
+    if (IsBearishCHoCH(PERIOD_CURRENT, SwingLookback, StructuralSwingMinBars, 1, etfBearishCHoCHLevel)) etfWasBearishCHoCH = true;
+    // (Tùy chọn vẽ CHoCH)
+
+    // Kiểm tra Liquidity Sweeps
+    if (UseLiquiditySweeps) {
+        if (etfLastSigLow.isValid && CheckAndGetBullishLiquiditySweep(PERIOD_CURRENT, etfLastSigLow, SweepMinSpikePoints, SweepCloseBackCandles, etfBullishSweepInfo, 1)) {
+            etfWasBullishSweep = true;
+            if(Draw_LiquiditySweeps) DrawLiquiditySweepMarker(PERIOD_CURRENT, etfBullishSweepInfo, etfLastSigLow, true, Bullish_LS_Color, (int)ArrowBullishSweepCode);
+        }
+        if (etfLastSigHigh.isValid && CheckAndGetBearishLiquiditySweep(PERIOD_CURRENT, etfLastSigHigh, SweepMinSpikePoints, SweepCloseBackCandles, etfBearishSweepInfo, 1)) {
+            etfWasBearishSweep = true;
+            if(Draw_LiquiditySweeps) DrawLiquiditySweepMarker(PERIOD_CURRENT, etfBearishSweepInfo, etfLastSigHigh, false, Bearish_LS_Color, (int)ArrowBearishSweepCode);
+        }
+    }
+
+    // --- 2. Cập nhật Xu Hướng Thị Trường ---
+    // DetermineMarketBias cần được cập nhật để nhận thêm các thông tin này nếu nó muốn sử dụng chúng trực tiếp
+    // Hoặc nó vẫn giữ logic hiện tại, và các yếu tố này được dùng chủ yếu cho điều kiện vào lệnh
+    // Hiện tại, DetermineMarketBias đã có logic BOS, CHoCH, Sweep bên trong nó dựa trên lastSigHigh/Low.
+    // Để đơn giản, chúng ta sẽ giữ DetermineMarketBias như cũ trước, và truyền các thông tin này vào Execute...
+    DetermineMarketBias(HTF_BiasPeriod, etfBullishOB, etfBearishOB, etfBullishFVG, etfBearishFVG); // Giữ nguyên chữ ký này
+
+    // --- 3. Tìm Kiếm Cơ Hội Giao Dịch ---
+    if ((currentBias == BIAS_BULLISH && TradeBullish) || (AllowTradingNeutralBias && TradeBullish)) {
+        ExecuteBuySetup(etfBullishOB, etfBullishFVG, 
+                        etfBullishSweepInfo, etfWasBullishSweep, 
+                        etfWasBullishBOS, etfBullishCHoCHLevel, etfWasBullishCHoCH,
+                        etfLastSigHigh, etfLastSigLow,
+                        currentHTF_POI_Context, 
+                        active_HTF_POI_Zone); // <<<<<<<<<<<<<<<<<<<<<<<< THAM SỐ MỚI
+    }
+    
+    
+    if ((currentBias == BIAS_BEARISH && TradeBearish) || (AllowTradingNeutralBias && TradeBearish)) {
+        ExecuteSellSetup(etfBearishOB, etfBearishFVG, 
+                         etfBearishSweepInfo, etfWasBearishSweep, 
+                         etfWasBearishBOS, etfBearishCHoCHLevel, etfWasBearishCHoCH,
+                         etfLastSigHigh, etfLastSigLow,
+                         currentHTF_POI_Context,
+                         active_HTF_POI_Zone); // <<<<<<<<<<<<<<<<<<<<<<<< THAM SỐ MỚI
+    }
+}
+//+------------------------------------------------------------------+
+//| Determine the market bias using ETF and HTF analysis             |
+//+------------------------------------------------------------------+
+void DetermineMarketBias(ENUM_TIMEFRAMES higherTimeframe,
+                         const PriceZone &etfBullishOB, const PriceZone &etfBearishOB,
+                         const PriceZone &etfBullishFVG, const PriceZone &etfBearishFVG) {
+    double etf_ma50_current[], etf_ma200_current[];
+    double etf_currentClose = iClose(_Symbol, PERIOD_CURRENT, 0);
+
+    if (CopyBuffer(maFastHandle, 0, 0, 2, etf_ma50_current) < 2 ||
+        CopyBuffer(maSlowHandle, 0, 0, 2, etf_ma200_current) < 2) {
+        PrintFormat("Error copying MA buffers for ETF %s: %d. MA analysis on ETF might be skipped.",
+                    EnumToString(PERIOD_CURRENT), GetLastError());
+    }
+
+    int etfBullishScore = 0;
+    int etfBearishScore = 0;
+    int htfBullishScore = 0;
+    int htfBearishScore = 0;
+
+    // --- 1. Phân tích Khung Thời Gian Hiện Tại (Execution Timeframe - ETF) ---
+    if (ArraySize(etf_ma50_current) > 0 && ArraySize(etf_ma200_current) > 0) {
+        if (etf_currentClose > etf_ma50_current[0] && etf_currentClose > etf_ma200_current[0]) etfBullishScore++;
+        if (etf_currentClose < etf_ma50_current[0] && etf_currentClose < etf_ma200_current[0]) etfBearishScore++;
+        if (etf_ma50_current[0] > etf_ma200_current[0]) etfBullishScore++;
+        if (etf_ma50_current[0] < etf_ma200_current[0]) etfBearishScore++;
+    }
+
+    if (etfBullishOB.isValid && etf_currentClose >= etfBullishOB.low) etfBullishScore++;
+    if (etfBearishOB.isValid && etf_currentClose <= etfBearishOB.high) etfBearishScore++;
+    if (etfBullishFVG.isValid && etf_currentClose > etfBullishFVG.low) etfBullishScore++;
+    if (etfBearishFVG.isValid && etf_currentClose < etfBearishFVG.high) etfBearishScore++;
+    
+     // if (HasHigherHighsHigherLows(SwingLookback)) etfBullishScore++; // Dòng cũ, sẽ xóa hoặc comment
+    // if (HasLowerHighsLowerLows(SwingLookback)) etfBearishScore++; // Dòng cũ, sẽ xóa hoặc comment
+
+    // Lấy các điểm swing quan trọng gần nhất trên ETF
+    // SwingLookback là input hiện có, StructuralSwingMinBars là input mới
+    PriceZone lastSigHighETF = GetLastSignificantSwingHigh(PERIOD_CURRENT, SwingLookback, StructuralSwingMinBars);
+    PriceZone lastSigLowETF  = GetLastSignificantSwingLow(PERIOD_CURRENT, SwingLookback, StructuralSwingMinBars);
+
+    // (Tùy chọn vẽ các swing này lên chart để debug)
+    // if(lastSigHighETF.isValid && Draw_Swings) DrawPriceMarker(lastSigHighETF.bar_index, lastSigHighETF.high, "ETF_SH", clrRed, SYMBOL_ARROWDOWN);
+    // if(lastSigLowETF.isValid && Draw_Swings) DrawPriceMarker(lastSigLowETF.bar_index, lastSigLowETF.low, "ETF_SL", clrBlue, SYMBOL_ARROWUP);
+
+
+    // Kiểm tra BOS trên ETF
+    // Giả sử xu hướng hiện tại được gợi ý bởi MA ETF
+    bool etfIsLikelyUptrend = (ArraySize(etf_ma50_current) > 0 && ArraySize(etf_ma200_current) > 0 && etf_ma50_current[0] > etf_ma200_current[0] && etf_currentClose > etf_ma50_current[0]);
+    bool etfIsLikelyDowntrend = (ArraySize(etf_ma50_current) > 0 && ArraySize(etf_ma200_current) > 0 && etf_ma50_current[0] < etf_ma200_current[0] && etf_currentClose < etf_ma50_current[0]);
+
+    if (etfIsLikelyUptrend && lastSigHighETF.isValid) {
+        if (CheckForBullishBOS(PERIOD_CURRENT, lastSigHighETF)) {
+            etfBullishScore += 2; // BOS tăng giá là tín hiệu mạnh
+            PrintFormat("ETF: Bullish BOS detected against SH at bar %d (%G)", lastSigHighETF.bar_index, lastSigHighETF.high);
+        }
+    }
+    if (etfIsLikelyDowntrend && lastSigLowETF.isValid) {
+        if (CheckForBearishBOS(PERIOD_CURRENT, lastSigLowETF)) {
+            etfBearishScore += 2; // BOS giảm giá là tín hiệu mạnh
+            PrintFormat("ETF: Bearish BOS detected against SL at bar %d (%G)", lastSigLowETF.bar_index, lastSigLowETF.low);
+        }
+    }
+    PriceZone bullishCHoCH_Level_ETF, bearishCHoCH_Level_ETF; // Biến để lưu mức CHoCH bị phá
+
+    if (IsBullishCHoCH(PERIOD_CURRENT, SwingLookback, StructuralSwingMinBars, 1, bullishCHoCH_Level_ETF)) {
+        etfBullishScore += 3; // Bullish CHoCH là tín hiệu đảo chiều tăng mạnh
+        PrintFormat("ETF: Bullish CHoCH detected! Broke LH at %G (bar %d)", bullishCHoCH_Level_ETF.high, bullishCHoCH_Level_ETF.bar_index);
+        // Nếu trước đó xu hướng là giảm, CHoCH này có thể reset điểm bearish hoặc tăng mạnh điểm bullish
+        if (currentBias == BIAS_BEARISH) { // Nếu xu hướng trước đó là giảm
+             Print("ETF: Bullish CHoCH potentially reversing prior bearish bias.");
+             // Có thể reset etfBearishScore hoặc tăng mạnh etfBullishScore hơn nữa
+        }
+    }
+    if (IsBearishCHoCH(PERIOD_CURRENT, SwingLookback, StructuralSwingMinBars, 1, bearishCHoCH_Level_ETF)) {
+        etfBearishScore += 3; // Bearish CHoCH là tín hiệu đảo chiều giảm mạnh
+        PrintFormat("ETF: Bearish CHoCH detected! Broke HL at %G (bar %d)", bearishCHoCH_Level_ETF.low, bearishCHoCH_Level_ETF.bar_index);
+        if (currentBias == BIAS_BULLISH) { // Nếu xu hướng trước đó là tăng
+            Print("ETF: Bearish CHoCH potentially reversing prior bullish bias.");
+        }
+    }
+    if (UseLiquiditySweeps) { // Kiểm tra input xem có bật tính năng này không
+        PriceZone bullishSweepCandleInfo; // Biến để lưu thông tin nến sweep (nếu cần dùng sau)
+        PriceZone bearishSweepCandleInfo;
+
+        // Kiểm tra Bullish Liquidity Sweep dựa trên lastSigLowETF (đã được lấy ở phần BOS/CHoCH)
+        if (lastSigLowETF.isValid) {
+            if (CheckAndGetBullishLiquiditySweep(PERIOD_CURRENT, lastSigLowETF, 
+                                                 SweepMinSpikePoints, SweepCloseBackCandles, 
+                                                 bullishSweepCandleInfo, 1)) { // check_bar_shift = 1 (nến đã đóng gần nhất)
+                etfBullishScore += 2; // Tăng điểm cho tín hiệu bullish (có thể điều chỉnh trọng số này)
+                PrintFormat("ETF: Bullish Liquidity Sweep detected! Swept SL at %G (bar %d). Sweep candle (shift %d) Low: %G.",
+                            lastSigLowETF.low, lastSigLowETF.bar_index, 
+                            bullishSweepCandleInfo.bar_index, bullishSweepCandleInfo.low);
+                
+                // Nếu muốn vẽ ngay tại đây (hoặc có thể truyền tín hiệu ra AnalyzeAndTrade để vẽ)
+                // if(Draw_LiquiditySweeps) { /* Gọi hàm vẽ mũi tên/ký hiệu */ }
+            }
+        }
+ if(Draw_LiquiditySweeps) {
+                DrawLiquiditySweepMarker(PERIOD_CURRENT, bullishSweepCandleInfo, lastSigLowETF, true, Bullish_LS_Color, (int)ArrowBullishSweepCode);
+            }
+        // Kiểm tra Bearish Liquidity Sweep dựa trên lastSigHighETF (đã được lấy ở phần BOS/CHoCH)
+        if (lastSigHighETF.isValid) {
+            if (CheckAndGetBearishLiquiditySweep(PERIOD_CURRENT, lastSigHighETF, 
+                                                 SweepMinSpikePoints, SweepCloseBackCandles, 
+                                                 bearishSweepCandleInfo, 1)) { // check_bar_shift = 1
+                etfBearishScore += 2; // Tăng điểm cho tín hiệu bearish
+                PrintFormat("ETF: Bearish Liquidity Sweep detected! Swept SH at %G (bar %d). Sweep candle (shift %d) High: %G.",
+                            lastSigHighETF.high, lastSigHighETF.bar_index,
+                            bearishSweepCandleInfo.bar_index, bearishSweepCandleInfo.high);
+
+                if(Draw_LiquiditySweeps) {
+                DrawLiquiditySweepMarker(PERIOD_CURRENT, bearishSweepCandleInfo, lastSigHighETF, false, Bearish_LS_Color, (int)ArrowBearishSweepCode);
+            }
+            }
+        }
+    }
+    
+    // --- 2. Phân tích Khung Thời Gian Cao Hơn (Higher Timeframe - HTF) ---
+    if (higherTimeframe != PERIOD_CURRENT && higherTimeframe > 0) {
+        long htf_bars_available = Bars(_Symbol, higherTimeframe);
+        int min_bars_for_ma = MathMax(MA_Fast_Period, MA_Slow_Period) + 5;
+
+        if (htf_bars_available < min_bars_for_ma) {
+            PrintFormat("HTF DBG: Not enough bars on HTF %s (%d) for MA (needs ~%d). HTF MA analysis skipped.",
+                        EnumToString(higherTimeframe), htf_bars_available, min_bars_for_ma);
+        } else {
+            double htf_currentClose = iClose(_Symbol, higherTimeframe, 0);
+            int err_code_htf_close = GetLastError(); // Kiểm tra lỗi ngay sau iClose
+
+            if (htf_currentClose == 0 && err_code_htf_close != 0) {
+                 PrintFormat("HTF DBG: Could not get close price for HTF %s. Error: %d. HTF analysis incomplete.",
+                             EnumToString(higherTimeframe), err_code_htf_close);
+            } else {
+            PriceZone bullishCHoCH_Level_HTF, bearishCHoCH_Level_HTF;
+            if (IsBullishCHoCH(PERIOD_CURRENT, SwingLookback, StructuralSwingMinBars, 1, bullishCHoCH_Level_HTF)) {
+        htfBullishScore += 3; // Bullish CHoCH là tín hiệu đảo chiều tăng mạnh
+        PrintFormat("HTF: Bullish CHoCH detected! Broke LH at %G (bar %d)", bullishCHoCH_Level_HTF.high, bullishCHoCH_Level_HTF.bar_index);
+        // Nếu trước đó xu hướng là giảm, CHoCH này có thể reset điểm bearish hoặc tăng mạnh điểm bullish
+        if (currentBias == BIAS_BEARISH) { // Nếu xu hướng trước đó là giảm
+             Print("HTF: Bullish CHoCH potentially reversing prior bearish bias.");
+             // Có thể reset etfBearishScore hoặc tăng mạnh etfBullishScore hơn nữa
+        }
+    }
+    if (IsBearishCHoCH(PERIOD_CURRENT, SwingLookback, StructuralSwingMinBars, 1, bearishCHoCH_Level_HTF)) {
+        htfBearishScore += 3; // Bearish CHoCH là tín hiệu đảo chiều giảm mạnh
+        PrintFormat("ETF: Bearish CHoCH detected! Broke HL at %G (bar %d)", bearishCHoCH_Level_HTF.low, bearishCHoCH_Level_HTF.bar_index);
+        if (currentBias == BIAS_BULLISH) { // Nếu xu hướng trước đó là tăng
+            Print("ETF: Bearish CHoCH potentially reversing prior bullish bias.");
+        }
+    }
+    if (UseLiquiditySweeps) { // Kiểm tra input xem có bật tính năng này không
+        PriceZone bullishSweepCandleInfo; // Biến để lưu thông tin nến sweep (nếu cần dùng sau)
+        PriceZone bearishSweepCandleInfo;
+
+        // Kiểm tra Bullish Liquidity Sweep dựa trên lastSigLowETF (đã được lấy ở phần BOS/CHoCH)
+        if (lastSigLowETF.isValid) {
+            if (CheckAndGetBullishLiquiditySweep(PERIOD_CURRENT, lastSigLowETF, 
+                                                 SweepMinSpikePoints, SweepCloseBackCandles, 
+                                                 bullishSweepCandleInfo, 1)) { // check_bar_shift = 1 (nến đã đóng gần nhất)
+                etfBullishScore += 2; // Tăng điểm cho tín hiệu bullish (có thể điều chỉnh trọng số này)
+                PrintFormat("ETF: Bullish Liquidity Sweep detected! Swept SL at %G (bar %d). Sweep candle (shift %d) Low: %G.",
+                            lastSigLowETF.low, lastSigLowETF.bar_index, 
+                            bullishSweepCandleInfo.bar_index, bullishSweepCandleInfo.low);
+                
+                // Nếu muốn vẽ ngay tại đây (hoặc có thể truyền tín hiệu ra AnalyzeAndTrade để vẽ)
+                // if(Draw_LiquiditySweeps) { /* Gọi hàm vẽ mũi tên/ký hiệu */ }
+            }
+        }
+
+        // Kiểm tra Bearish Liquidity Sweep dựa trên lastSigHighETF (đã được lấy ở phần BOS/CHoCH)
+        if (lastSigHighETF.isValid) {
+            if (CheckAndGetBearishLiquiditySweep(PERIOD_CURRENT, lastSigHighETF, 
+                                                 SweepMinSpikePoints, SweepCloseBackCandles, 
+                                                 bearishSweepCandleInfo, 1)) { // check_bar_shift = 1
+                etfBearishScore += 2; // Tăng điểm cho tín hiệu bearish
+                PrintFormat("ETF: Bearish Liquidity Sweep detected! Swept SH at %G (bar %d). Sweep candle (shift %d) High: %G.",
+                            lastSigHighETF.high, lastSigHighETF.bar_index,
+                            bearishSweepCandleInfo.bar_index, bearishSweepCandleInfo.high);
+
+                // if(Draw_LiquiditySweeps) { /* Gọi hàm vẽ mũi tên/ký hiệu */ }
+            }
+        }
+    }
+                PrintFormat("HTF DBG Params: Symbol=%s, HTF=%s (%d), FastPeriod=%d, SlowPeriod=%d, MODE_SMA=%d, PRICE_CLOSE=%d",
+                            _Symbol, EnumToString(higherTimeframe), higherTimeframe,
+                            MA_Fast_Period, MA_Slow_Period, MODE_SMA, PRICE_CLOSE);
+                
+                double htf_maFast_val0 = 0.0; // Khởi tạo
+                double htf_maSlow_val0 = 0.0; // Khởi tạo
+                int err_code_ma;
+
+                // MA Analysis on HTF - Sử dụng iMA 6 tham số
+                htf_maFast_val0 = iMA(_Symbol, higherTimeframe, MA_Fast_Period, 0, MODE_SMA, (ENUM_APPLIED_PRICE)PRICE_CLOSE); // 6 params
+                err_code_ma = GetLastError();
+                PrintFormat("HTF DBG MA: htf_maFast_val0 = %G, LastError_FastMA = %d", htf_maFast_val0, err_code_ma);
+                if(err_code_ma != 0) ResetLastError();
+
+                htf_maSlow_val0 = iMA(_Symbol, higherTimeframe, MA_Slow_Period, 0, MODE_SMA, (ENUM_APPLIED_PRICE)PRICE_CLOSE); // 6 params
+                err_code_ma = GetLastError();
+                PrintFormat("HTF DBG MA: htf_maSlow_val0 = %G, LastError_SlowMA = %d", htf_maSlow_val0, err_code_ma);
+                if(err_code_ma != 0) ResetLastError();
+    
+                if (htf_maFast_val0 != 0 || htf_maSlow_val0 != 0) {
+                    if (htf_currentClose > htf_maFast_val0 && htf_currentClose > htf_maSlow_val0) htfBullishScore++;
+                    if (htf_currentClose < htf_maFast_val0 && htf_currentClose < htf_maSlow_val0) htfBearishScore++;
+                    if (htf_maFast_val0 > htf_maSlow_val0 && htf_maSlow_val0 !=0) htfBullishScore++;
+                    if (htf_maFast_val0 < htf_maSlow_val0 && htf_maFast_val0 !=0) htfBearishScore++;
+                } else {
+                    // In thêm mã lỗi của iClose nếu htf_currentClose cũng = 0
+                    PrintFormat("HTF DBG MA: Both MA values for HTF %s are zero. htf_currentClose=%G (err:%d). MA analysis skipped.", 
+                                EnumToString(higherTimeframe), htf_currentClose, err_code_htf_close);
+                }
+            }
+        }
+
+        PriceZone htf_bullishOB = FindBullishOrderBlock(higherTimeframe, OrderBlockLookbackPeriod, MinMoveAfterOBFactor, MinImpulseCandles);
+        PriceZone htf_bearishOB = FindBearishOrderBlock(higherTimeframe, OrderBlockLookbackPeriod, MinMoveAfterOBFactor, MinImpulseCandles);
+        PriceZone htf_bullishFVG = FindBullishFVG(higherTimeframe, FVGLookbackPeriod, MinFVGSizePoints);
+        PriceZone htf_bearishFVG = FindBearishFVG(higherTimeframe, FVGLookbackPeriod, MinFVGSizePoints);
+
+        if (htf_bullishOB.isValid) {
+            if (etf_currentClose >= htf_bullishOB.low && etf_currentClose <= htf_bullishOB.high) htfBullishScore += 2;
+            else if (etf_currentClose > htf_bullishOB.high) htfBullishScore++;
+        }
+        if (htf_bearishOB.isValid) {
+            if (etf_currentClose <= htf_bearishOB.high && etf_currentClose >= htf_bearishOB.low) htfBearishScore += 2;
+            else if (etf_currentClose < htf_bearishOB.low) htfBearishScore++;
+        }
+        if (htf_bullishFVG.isValid && etf_currentClose >= htf_bullishFVG.low && etf_currentClose <= htf_bullishFVG.high) htfBullishScore++;
+        if (htf_bearishFVG.isValid && etf_currentClose <= htf_bearishFVG.high && etf_currentClose >= htf_bearishFVG.low) htfBearishScore++;
+    }
+
+    // --- 3. Kết hợp Tín hiệu và Quyết định Xu Hướng Cuối Cùng ---
+    int finalBullishScore = etfBullishScore;
+    int finalBearishScore = etfBearishScore;
+
+    if (htfBullishScore > htfBearishScore) {
+        finalBullishScore += htfBullishScore * 2;
+    } else if (htfBearishScore > htfBullishScore) {
+        finalBearishScore += htfBearishScore * 2;
+    }
+
+    int biasConfirmationThreshold = 2;
+    if (AllowTradingNeutralBias && (htfBullishScore == 0 && htfBearishScore == 0)) {
+        biasConfirmationThreshold = 1;
+    }
+    
+    if (finalBullishScore > finalBearishScore && finalBullishScore >= biasConfirmationThreshold) {
+        currentBias = BIAS_BULLISH;
+    } else if (finalBearishScore > finalBullishScore && finalBearishScore >= biasConfirmationThreshold) {
+        currentBias = BIAS_BEARISH;
+    } else {
+        currentBias = BIAS_NEUTRAL;
+    }
+
+    PrintFormat("Bias Final: ETF(B:%d,S:%d) HTF(B:%d,S:%d) Final(B:%d,S:%d) -> %s",
+                etfBullishScore, etfBearishScore, htfBullishScore, htfBearishScore,
+                finalBullishScore, finalBearishScore, BiasToString(currentBias));
+}
+
+//+------------------------------------------------------------------+
+//| Checks for higher highs and higher lows pattern                  |
+//+------------------------------------------------------------------+
+bool HasHigherHighsHigherLows(int lookback) {
+   int higherHighs = 0;
+   int higherLows = 0;
+   
+   for (int i = 1; i < lookback-1; i++) {
+      if (iHigh(_Symbol, PERIOD_CURRENT, i) > iHigh(_Symbol, PERIOD_CURRENT, i+1))
+         higherHighs++;
+         
+      if (iLow(_Symbol, PERIOD_CURRENT, i) > iLow(_Symbol, PERIOD_CURRENT, i+1))
+         higherLows++;
+   }
+   
+   return (higherHighs > lookback/2 && higherLows > lookback/2);
+}
+
+//+------------------------------------------------------------------+
+//| Checks for lower highs and lower lows pattern                    |
+//+------------------------------------------------------------------+
+bool HasLowerHighsLowerLows(int lookback) {
+   int lowerHighs = 0;
+   int lowerLows = 0;
+   
+   for (int i = 1; i < lookback-1; i++) {
+      if (iHigh(_Symbol, PERIOD_CURRENT, i) < iHigh(_Symbol, PERIOD_CURRENT, i+1))
+         lowerHighs++;
+         
+      if (iLow(_Symbol, PERIOD_CURRENT, i) < iLow(_Symbol, PERIOD_CURRENT, i+1))
+         lowerLows++;
+   }
+   
+   return (lowerHighs > lookback/2 && lowerLows > lookback/2);
+}
+
+//+------------------------------------------------------------------+
+//| Convert bias enum to string                                      |
+//+------------------------------------------------------------------+
+string BiasToString(ENUM_BIAS bias) {
+   switch(bias) {
+      case BIAS_BULLISH: return "Bullish";
+      case BIAS_BEARISH: return "Bearish";
+      default: return "Neutral";
+   }
+}
+//+------------------------------------------------------------------+
+//| Delete objects by prefix                                         |
+//+------------------------------------------------------------------+
+void DeleteObjectsByPrefix(const string prefix) {
+    // Sử dụng vòng lặp for thay vì ObjectsTotal để an toàn hơn khi xóa
+    for (int i = (int)ObjectsTotal(0, -1, -1) - 1; i >= 0; i--) { // Sửa lỗi: ObjectsTotal trả về long
+        string obj_name = ObjectName(0, i, -1, -1); // Sửa lỗi: ObjectName cần chart_ID và sub_window
+        if (StringFind(obj_name, prefix, 0) == 0) { // Prefix found at the beginning
+            ObjectDelete(0, obj_name); // Sửa lỗi: ObjectDelete cần chart_ID
+        }
+    }
+}
+//+------------------------------------------------------------------+
+//| Find the most recent valid Bullish Order Block                   |
+//+------------------------------------------------------------------+
+PriceZone FindBullishOrderBlock(ENUM_TIMEFRAMES timeframe, int ob_lookback_period, double min_move_factor, int min_impulse_candles, int shift = 1) {
+    PriceZone ob; // Uses the default constructor which calls Reset()
+    MqlRates rates[];
+    ArraySetAsSeries(rates, true);
+
+    int rates_to_copy = ob_lookback_period + min_impulse_candles + shift + 5; 
+    if (CopyRates(_Symbol, timeframe, shift, rates_to_copy, rates) < rates_to_copy) {
+        PrintFormat("Error copying rates for Bullish OB detection on %s: %d", EnumToString(timeframe), GetLastError());
+        return ob;
+    }
+
+    for (int i = min_impulse_candles; i < ob_lookback_period + min_impulse_candles; i++) {
+        if (i >= ArraySize(rates) -1) break; 
+
+        if (rates[i].close < rates[i].open) { 
+            bool strong_bullish_move = true;
+            double total_impulse_move_range = 0;
+            double highest_high_after_ob = 0;
+
+            for(int k=0; k < min_impulse_candles; k++) {
+                int impulse_candle_idx = i - 1 - k;
+                if (impulse_candle_idx < 0) {
+                    strong_bullish_move = false; 
+                    break;
+                }
+                if (rates[impulse_candle_idx].close <= rates[impulse_candle_idx].open) {
+                    strong_bullish_move = false;
+                    break;
+                }
+                if (rates[impulse_candle_idx].high > highest_high_after_ob) {
+                    highest_high_after_ob = rates[impulse_candle_idx].high;
+                }
+                total_impulse_move_range += (rates[impulse_candle_idx].high - rates[impulse_candle_idx].low); // Hoặc dùng close - open
+            }
+            
+            if (!strong_bullish_move) continue;
+
+            double ob_candle_body = rates[i].open - rates[i].close; // Thân nến OB
+            // Tổng range của các nến impulse hoặc tổng body
+            if (highest_high_after_ob > rates[i].high && total_impulse_move_range >= ob_candle_body * min_move_factor) {
+                ob.high = rates[i].high;
+                ob.low = rates[i].low;
+                ob.bar_index = (int)iBarShift(_Symbol, timeframe, rates[i].time); 
+                ob.isValid = true;
+                return ob; 
+            }
+        }
+    }
+    return ob; 
+}
+
+//+------------------------------------------------------------------+
+//| Find the most recent valid Bearish Order Block                   |
+//+------------------------------------------------------------------+
+PriceZone FindBearishOrderBlock(ENUM_TIMEFRAMES timeframe, int ob_lookback_period, double min_move_factor, int min_impulse_candles, int shift = 1) {
+    PriceZone ob;
+    MqlRates rates[];
+    ArraySetAsSeries(rates, true);
+
+    int rates_to_copy = ob_lookback_period + min_impulse_candles + shift + 5;
+    if (CopyRates(_Symbol, timeframe, shift, rates_to_copy, rates) < rates_to_copy) {
+        PrintFormat("Error copying rates for Bearish OB detection on %s: %d", EnumToString(timeframe), GetLastError());
+        return ob;
+    }
+
+    for (int i = min_impulse_candles; i < ob_lookback_period + min_impulse_candles; i++) {
+        if (i >= ArraySize(rates)-1) break;
+
+        if (rates[i].close > rates[i].open) { 
+            bool strong_bearish_move = true;
+            double total_impulse_move_range = 0;
+            double lowest_low_after_ob = rates[0].low; // Khởi tạo với giá trị cao để so sánh
+            if (ArraySize(rates) > 0 && min_impulse_candles > 0 && (i-1) >=0 ) { // Đảm bảo có nến để lấy low
+                 lowest_low_after_ob = rates[i-1].low; // Lấy low của nến impulse đầu tiên làm mốc ban đầu
+            }
+
+
+            for(int k=0; k < min_impulse_candles; k++) {
+                int impulse_candle_idx = i - 1 - k;
+                 if (impulse_candle_idx < 0) {
+                    strong_bearish_move = false; 
+                    break;
+                }
+                if (rates[impulse_candle_idx].close >= rates[impulse_candle_idx].open) {
+                    strong_bearish_move = false;
+                    break;
+                }
+                if (rates[impulse_candle_idx].low < lowest_low_after_ob) {
+                    lowest_low_after_ob = rates[impulse_candle_idx].low;
+                }
+                total_impulse_move_range += (rates[impulse_candle_idx].high - rates[impulse_candle_idx].low); // Hoặc dùng open - close
+            }
+
+            if (!strong_bearish_move) continue;
+
+            double ob_candle_body = rates[i].close - rates[i].open; // Thân nến OB
+            if (lowest_low_after_ob < rates[i].low && total_impulse_move_range >= ob_candle_body * min_move_factor) {
+                ob.high = rates[i].high;
+                ob.low = rates[i].low;
+                ob.bar_index = (int)iBarShift(_Symbol, timeframe, rates[i].time);
+                ob.isValid = true;
+                return ob; 
+            }
+        }
+    }
+    return ob;
+}
+//+------------------------------------------------------------------+
+//| Find the most recent valid Bullish Fair Value Gap (FVG)          |
+//+------------------------------------------------------------------+
+PriceZone FindBullishFVG(ENUM_TIMEFRAMES timeframe, int fvg_lookback_period, double min_fvg_size_points, int shift) { // Chú ý: không có "=1" ở tham số shift trong định nghĩa
+    PriceZone fvg; // Khởi tạo: fvg.isValid sẽ là false
+    MqlRates rates[];
+    ArraySetAsSeries(rates, true);
+
+    // Cần ít nhất 3 nến để tạo FVG, cộng với lookback và shift
+    // rates[0] là nến tại 'shift' (ví dụ nến đã đóng gần nhất trong phạm vi quét)
+    // FVG được xác định bởi nến 0, 1, 2 (tính từ vị trí bắt đầu quét ngược + shift)
+    // Nến (i)    : nến thứ 3 (phải) của cụm 3 nến
+    // Nến (i+1)  : nến thứ 2 (giữa, nơi FVG hình thành)
+    // Nến (i+2)  : nến thứ 1 (trái) của cụm 3 nến
+    int rates_to_copy = fvg_lookback_period + 3 + shift; // Thêm buffer nhỏ
+    if (CopyRates(_Symbol, timeframe, shift, rates_to_copy, rates) < rates_to_copy) {
+        PrintFormat("Error copying rates for Bullish FVG detection on %s: %d", EnumToString(timeframe), GetLastError());
+        return fvg;
+    }
+
+    // Quét ngược từ '0' (tương ứng với 'shift' trong CopyRates), tìm cụm 3 nến.
+    // 'i' sẽ là index trong mảng 'rates' cho nến thứ 3 (nến bên phải nhất trong cụm 3 nến đang xét)
+    for (int i = 0; i < fvg_lookback_period; i++) { // fvg_lookback_period giới hạn số cụm 3 nến được kiểm tra
+        if (i + 2 >= ArraySize(rates)) { // Đảm bảo có đủ 3 nến (rates[i], rates[i+1], rates[i+2])
+            break; 
+        }
+
+        MqlRates candle3 = rates[i];   // Nến thứ 3 (phải)
+        MqlRates candle2 = rates[i+1]; // Nến thứ 2 (giữa)
+        MqlRates candle1 = rates[i+2]; // Nến thứ 1 (trái)
+
+        // Điều kiện Bullish FVG: Low của nến 3 > High của nến 1
+        if (candle3.low > candle1.high) {
+            double fvg_size_actual = (candle3.low - candle1.high) / _Point; 
+
+            if (min_fvg_size_points > 0 && fvg_size_actual < min_fvg_size_points) {
+                continue; // Bỏ qua FVG quá nhỏ nếu có đặt MinFVGSizePoints
+            }
+
+            fvg.high = candle3.low;  // Đỉnh của FVG (cạnh trên)
+            fvg.low = candle1.high;  // Đáy của FVG (cạnh dưới)
+            // bar_index của FVG là bar_index của nến thứ 2 (candle2), nơi khoảng trống tồn tại
+            fvg.bar_index = (int)iBarShift(_Symbol, timeframe, candle2.time); // Lấy bar index chuẩn của MT5
+            fvg.isValid = true;
+            // PrintFormat("Found Bullish FVG at candle2 time: %s, High: %.*f, Low: %.*f", TimeToString(candle2.time), _Digits, fvg.high, _Digits, fvg.low);
+            return fvg; // Trả về FVG gần nhất tìm thấy
+        }
+    }
+    return fvg; // Không tìm thấy FVG nào hợp lệ
+}
+//+------------------------------------------------------------------+
+//| Find the most recent valid Bearish Fair Value Gap (FVG)          |
+//+------------------------------------------------------------------+
+PriceZone FindBearishFVG(ENUM_TIMEFRAMES timeframe, int fvg_lookback_period, double min_fvg_size_points, int shift) { // Chú ý: không có "=1" ở tham số shift
+    PriceZone fvg; // Khởi tạo: fvg.isValid sẽ là false
+    MqlRates rates[];
+    ArraySetAsSeries(rates, true);
+
+    int rates_to_copy = fvg_lookback_period + 3 + shift; 
+    if (CopyRates(_Symbol, timeframe, shift, rates_to_copy, rates) < rates_to_copy) {
+        PrintFormat("Error copying rates for Bearish FVG detection on %s: %d", EnumToString(timeframe), GetLastError());
+        return fvg;
+    }
+
+    for (int i = 0; i < fvg_lookback_period; i++) {
+        if (i + 2 >= ArraySize(rates)) {
+            break; 
+        }
+
+        MqlRates candle3 = rates[i];   // Nến thứ 3 (phải)
+        MqlRates candle2 = rates[i+1]; // Nến thứ 2 (giữa)
+        MqlRates candle1 = rates[i+2]; // Nến thứ 1 (trái)
+
+        // Điều kiện Bearish FVG: High của nến 3 < Low của nến 1
+        if (candle3.high < candle1.low) {
+            double fvg_size_actual = (candle1.low - candle3.high) / _Point;
+
+            if (min_fvg_size_points > 0 && fvg_size_actual < min_fvg_size_points) {
+                continue;
+            }
+
+            fvg.high = candle1.low;  // Đỉnh của FVG (cạnh trên)
+            fvg.low = candle3.high;  // Đáy của FVG (cạnh dưới)
+            fvg.bar_index = (int)iBarShift(_Symbol, timeframe, candle2.time); // Lấy bar index chuẩn của MT5
+            fvg.isValid = true;
+            //PrintFormat("Found Bearish FVG at candle2 time: %s, High: %.*f, Low: %.*f", TimeToString(candle2.time), _Digits, fvg.high, _Digits, fvg.low);
+            return fvg; // Trả về FVG gần nhất tìm thấy
+        }
+    }
+    return fvg; // Không tìm thấy FVG nào hợp lệ
+}
+//+------------------------------------------------------------------+
+//| Find the most recent significant swing high                      |
+//| A significant swing high has N bars on its left and N bars on    |
+//| its right with lower highs.                                      |
+//+------------------------------------------------------------------+
+PriceZone GetLastSignificantSwingHigh(ENUM_TIMEFRAMES timeframe, int lookback_range, int N, int shift_start = 1) {
+    PriceZone swing_high; // Default: isValid = false
+    MqlRates rates[];
+    ArraySetAsSeries(rates, true);
+
+    // Cần đủ nến để quét: lookback_range để tìm ứng viên, và N nến ở mỗi bên để xác nhận
+    // rates[0] là nến tại shift_start
+    int rates_to_copy = shift_start + lookback_range + N + 1; // Thêm buffer
+    if (CopyRates(_Symbol, timeframe, 0, rates_to_copy, rates) < rates_to_copy) { // Lấy từ bar 0 để dễ tính index
+        PrintFormat("Error copying rates for GetLastSignificantSwingHigh on %s: %d", EnumToString(timeframe), GetLastError());
+        return swing_high;
+    }
+
+    // Quét ngược từ nến 'shift_start' (ví dụ: nến 1 - đã đóng gần nhất)
+    // Candidate_idx là index trong mảng 'rates'
+    for (int candidate_idx = shift_start + N; candidate_idx < shift_start + lookback_range + N; candidate_idx++) {
+        if (candidate_idx >= ArraySize(rates) - N) { // Đảm bảo đủ N nến bên phải (chỉ số thấp hơn trong mảng rates)
+            break;
+        }
+
+        bool is_swing_high = true;
+        double candidate_high = rates[candidate_idx].high;
+
+        // Kiểm tra N nến bên trái (chỉ số lớn hơn trong mảng rates)
+        for (int j = 1; j <= N; j++) {
+            if (rates[candidate_idx + j].high >= candidate_high) {
+                is_swing_high = false;
+                break;
+            }
+        }
+        if (!is_swing_high) continue;
+
+        // Kiểm tra N nến bên phải (chỉ số nhỏ hơn trong mảng rates)
+        for (int j = 1; j <= N; j++) {
+            if (rates[candidate_idx - j].high >= candidate_high) {
+                is_swing_high = false;
+                break;
+            }
+        }
+
+        if (is_swing_high) {
+            swing_high.high = candidate_high;
+            swing_high.low = rates[candidate_idx].low; // Lưu cả low của nến swing
+            swing_high.bar_index = (int)iBarShift(_Symbol, timeframe, rates[candidate_idx].time); // Lấy bar index chuẩn của MT5
+            swing_high.isValid = true;
+            // PrintFormat("Found Sig Swing High at bar %d (%s), Price: %G", swing_high.bar_index, TimeToString(rates[candidate_idx].time), swing_high.high);
+            return swing_high; // Trả về swing high quan trọng gần nhất tìm thấy
+        }
+    }
+    return swing_high;
+}
+
+//+------------------------------------------------------------------+
+//| Find the most recent significant swing low                       |
+//| A significant swing low has N bars on its left and N bars on     |
+//| its right with higher lows.                                      |
+//+------------------------------------------------------------------+
+PriceZone GetLastSignificantSwingLow(ENUM_TIMEFRAMES timeframe, int lookback_range, int N, int shift_start = 1) {
+    PriceZone swing_low; // Default: isValid = false
+    MqlRates rates[];
+    ArraySetAsSeries(rates, true);
+
+    int rates_to_copy = shift_start + lookback_range + N + 1;
+    if (CopyRates(_Symbol, timeframe, 0, rates_to_copy, rates) < rates_to_copy) {
+        PrintFormat("Error copying rates for GetLastSignificantSwingLow on %s: %d", EnumToString(timeframe), GetLastError());
+        return swing_low;
+    }
+
+    for (int candidate_idx = shift_start + N; candidate_idx < shift_start + lookback_range + N; candidate_idx++) {
+         if (candidate_idx >= ArraySize(rates) - N) {
+            break;
+        }
+
+        bool is_swing_low = true;
+        double candidate_low = rates[candidate_idx].low;
+
+        // Kiểm tra N nến bên trái
+        for (int j = 1; j <= N; j++) {
+            if (rates[candidate_idx + j].low <= candidate_low) {
+                is_swing_low = false;
+                break;
+            }
+        }
+        if (!is_swing_low) continue;
+
+        // Kiểm tra N nến bên phải
+        for (int j = 1; j <= N; j++) {
+            if (rates[candidate_idx - j].low <= candidate_low) {
+                is_swing_low = false;
+                break;
+            }
+        }
+
+        if (is_swing_low) {
+            swing_low.low = candidate_low;
+            swing_low.high = rates[candidate_idx].high; // Lưu cả high của nến swing
+            swing_low.bar_index = (int)iBarShift(_Symbol, timeframe, rates[candidate_idx].time);
+            swing_low.isValid = true;
+            // PrintFormat("Found Sig Swing Low at bar %d (%s), Price: %G", swing_low.bar_index, TimeToString(rates[candidate_idx].time), swing_low.low);
+            return swing_low;
+        }
+    }
+    return swing_low;
+}
+//+------------------------------------------------------------------+
+//| Check for a Bullish Break of Structure (BOS)                     |
+//| Checks if price closes above the provided previous swing high.   |
+//+------------------------------------------------------------------+
+bool CheckForBullishBOS(ENUM_TIMEFRAMES timeframe, const PriceZone &prev_swing_high, int confirmation_shift = 1) {
+    if (!prev_swing_high.isValid) {
+        return false;
+    }
+
+    // confirmation_shift = 1: Kiểm tra nến đã đóng gần nhất
+    // confirmation_shift = 0: Kiểm tra nến hiện tại đang hình thành (có thể repaint)
+    double current_close = iClose(_Symbol, timeframe, confirmation_shift);
+    if (current_close == 0 && GetLastError() != 0) { // Lỗi lấy giá đóng cửa
+         double min_break_value = (BOS_CHoCH_MinBreakPoints == 0) ? 0 : BOS_CHoCH_MinBreakPoints * _Point;
+        PrintFormat("CheckForBullishBOS: Error getting close for %s, shift %d. Error: %d", EnumToString(timeframe), confirmation_shift, GetLastError());
+        return false;
+    }
+    
+    if (current_close > prev_swing_high.high) {
+        // PrintFormat("Bullish BOS confirmed on %s against SH at %G (bar %d). Close: %G",
+        //             EnumToString(timeframe), prev_swing_high.high, prev_swing_high.bar_index, current_close);
+        return true;
+    }
+    return false;
+}
+//+------------------------------------------------------------------+
+//| Check for a Bullish Change of Character (CHoCH)                  |
+//+------------------------------------------------------------------+
+bool IsBullishCHoCH(ENUM_TIMEFRAMES timeframe, int swing_lookback, int N_structural_bars, int confirmation_shift , PriceZone &choch_level_broken ) {
+    choch_level_broken.Reset(); // Reset output parameter
+
+    // 1. Tìm đáy swing quan trọng gần nhất (lastLL)
+    //    Để đảm bảo lastLL thực sự là quá khứ so với nến xác nhận, ta dịch chuyển điểm bắt đầu tìm kiếm của GetLastSignificantSwingLow
+    PriceZone lastLL = GetLastSignificantSwingLow(timeframe, swing_lookback, N_structural_bars, confirmation_shift + N_structural_bars +1);
+    if (!lastLL.isValid) {
+        PrintFormat("IsBullishCHoCH (%s): No valid lastLL found.", EnumToString(timeframe));
+        return false;
+    }
+
+    // 2. Tìm đỉnh swing quan trọng (LH) xảy ra TRƯỚC lastLL.
+    //    Chúng ta sẽ tìm trong phạm vi lookback kết thúc ngay trước khi lastLL hình thành.
+    //    shift_start for GetLastSignificantSwingHigh should be lastLL.bar_index + 1
+    //    lookback_range for this search should be reasonable, e.g. swing_lookback again.
+    PriceZone lh_before_ll = GetLastSignificantSwingHigh(timeframe, swing_lookback, N_structural_bars, lastLL.bar_index + 1);
+    
+    if (!lh_before_ll.isValid) {
+        PrintFormat("IsBullishCHoCH (%s): No valid LH before LL at bar %d found.", EnumToString(timeframe), lastLL.bar_index);
+        return false;
+    }
+    // Đảm bảo LH thực sự xảy ra trước LL (bar_index của LH > bar_index của LL vì index đếm ngược)
+    // và LH không phải là đỉnh được tạo sau khi LL đã hình thành (lh_before_ll.bar_index > lastLL.bar_index)
+    if (lh_before_ll.bar_index <= lastLL.bar_index) { // Nếu LH không ở trước LL theo đúng logic index
+         PrintFormat("IsBullishCHoCH (%s): LH at bar %d is not structurally before LL at bar %d.", EnumToString(timeframe), lh_before_ll.bar_index, lastLL.bar_index);
+        return false;
+    }
+
+
+    // 3. Kiểm tra giá đóng cửa hiện tại có phá vỡ đỉnh LH đó không
+    double current_close = iClose(_Symbol, timeframe, confirmation_shift);
+    if (current_close == 0 && GetLastError() != 0) return false; // Lỗi lấy giá
+double min_break_value = (BOS_CHoCH_MinBreakPoints == 0) ? 0 : BOS_CHoCH_MinBreakPoints * _Point;
+    if (current_close > lh_before_ll.high) {
+        choch_level_broken = lh_before_ll; // Lưu lại thông tin của mức CHoCH bị phá
+        // PrintFormat("Bullish CHoCH confirmed on %s. Broke LH at %G (bar %d). LL was at bar %d. Close: %G",
+        //             EnumToString(timeframe), lh_before_ll.high, lh_before_ll.bar_index, lastLL.bar_index, current_close);
+        return true;
+    }
+    return false;
+}
+//+------------------------------------------------------------------+
+//| Check for a Bearish Break of Structure (BOS)                     |
+//| Checks if price closes below the provided previous swing low.    |
+//+------------------------------------------------------------------+
+bool CheckForBearishBOS(ENUM_TIMEFRAMES timeframe, const PriceZone &prev_swing_low, int confirmation_shift = 1) {
+    if (!prev_swing_low.isValid) {
+        return false;
+    }
+
+    double current_close = iClose(_Symbol, timeframe, confirmation_shift);
+     if (current_close == 0 && GetLastError() != 0) { // Lỗi lấy giá đóng cửa
+        PrintFormat("CheckForBearishBOS: Error getting close for %s, shift %d. Error: %d", EnumToString(timeframe), confirmation_shift, GetLastError());
+        return false;
+    }
+double min_break_value = (BOS_CHoCH_MinBreakPoints == 0) ? 0 : BOS_CHoCH_MinBreakPoints * _Point;
+    if (current_close < prev_swing_low.low) {
+        // PrintFormat("Bearish BOS confirmed on %s against SL at %G (bar %d). Close: %G",
+        //             EnumToString(timeframe), prev_swing_low.low, prev_swing_low.bar_index, current_close);
+        return true;
+    }
+    return false;
+}
+//+------------------------------------------------------------------+
+//| Check for a Bearish Change of Character (CHoCH)                  |
+//+------------------------------------------------------------------+
+bool IsBearishCHoCH(ENUM_TIMEFRAMES timeframe, int swing_lookback, int N_structural_bars, int confirmation_shift , PriceZone &choch_level_broken ) {
+    choch_level_broken.Reset();
+
+    // 1. Tìm đỉnh swing quan trọng gần nhất (lastHH)
+    PriceZone lastHH = GetLastSignificantSwingHigh(timeframe, swing_lookback, N_structural_bars, confirmation_shift + N_structural_bars + 1);
+    if (!lastHH.isValid) {
+        PrintFormat("IsBearishCHoCH (%s): No valid lastHH found.", EnumToString(timeframe));
+        return false;
+    }
+
+    // 2. Tìm đáy swing quan trọng (HL) xảy ra TRƯỚC lastHH.
+    PriceZone hl_before_hh = GetLastSignificantSwingLow(timeframe, swing_lookback, N_structural_bars, lastHH.bar_index + 1);
+
+    if (!hl_before_hh.isValid) {
+        PrintFormat("IsBearishCHoCH (%s): No valid HL before HH at bar %d found.", EnumToString(timeframe), lastHH.bar_index);
+        return false;
+    }
+    if (hl_before_hh.bar_index <= lastHH.bar_index) {
+         //PrintFormat("IsBearishCHoCH (%s): HL at bar %d is not structurally before HH at bar %d.", EnumToString(timeframe), hl_before_hh.bar_index, lastHH.bar_index);
+        return false;
+    }
+
+    // 3. Kiểm tra giá đóng cửa hiện tại có phá vỡ đáy HL đó không
+    double current_close = iClose(_Symbol, timeframe, confirmation_shift);
+    if (current_close == 0 && GetLastError() != 0) return false;
+ double min_break_value = (BOS_CHoCH_MinBreakPoints == 0) ? 0 : BOS_CHoCH_MinBreakPoints * _Point;
+    if (current_close < hl_before_hh.low) {
+        choch_level_broken = hl_before_hh;
+        // PrintFormat("Bearish CHoCH confirmed on %s. Broke HL at %G (bar %d). HH was at bar %d. Close: %G",
+        //             EnumToString(timeframe), hl_before_hh.low, hl_before_hh.bar_index, lastHH.bar_index, current_close);
+        return true;
+    }
+    return false;
+}
+//+------------------------------------------------------------------+
+//| Check for a Bullish Liquidity Sweep (sweep of lows)            |
+//| Returns true if a sweep is detected, sweep_candle_info has details. |
+//+------------------------------------------------------------------+
+bool CheckAndGetBullishLiquiditySweep(ENUM_TIMEFRAMES timeframe, const PriceZone &prev_swing_low,
+                                     double min_spike_points, int max_close_back_candles,
+                                     PriceZone &sweep_candle_info, int check_bar_shift = 1) {
+    sweep_candle_info.Reset();
+    if (!prev_swing_low.isValid) return false;
+
+    MqlRates rates[];
+    // Cần lấy 'max_close_back_candles' nến kể từ 'check_bar_shift'
+    // Ví dụ: check_bar_shift=1, max_close_back_candles=1 => chỉ cần nến 1
+    //         check_bar_shift=1, max_close_back_candles=2 => cần nến 1 và 0
+    // CopyRates(..., check_bar_shift, count, ...)
+    // Count sẽ là max_close_back_candles. Mảng rates sẽ có index 0 là nến tại check_bar_shift.
+    int rates_to_copy = max_close_back_candles;
+    if (CopyRates(_Symbol, timeframe, check_bar_shift, rates_to_copy, rates) < rates_to_copy) {
+        PrintFormat("CheckAndGetBullishLiquiditySweep: Error copying rates. %s", EnumToString(timeframe));
+        return false;
+    }
+    ArraySetAsSeries(rates, false); // rates[0] là nến tại check_bar_shift, rates[1] là nến sau đó (về quá khứ nếu series=true)
+                                    // Để dễ hiểu: rates[0] là nến check_bar_shift, rates[rates_to_copy-1] là nến xa nhất
+
+    // Nến đầu tiên trong mảng rates (rates[0]) là nến tiềm năng thực hiện sweep (tại check_bar_shift)
+    double spike_actual = (prev_swing_low.low - rates[0].low) / _Point;
+
+    if (rates[0].low < prev_swing_low.low && spike_actual >= min_spike_points) { // Giá đã đi xuống dưới mức swing low và đủ độ sâu
+        // Bây giờ kiểm tra xem giá có đóng cửa trở lại trên mức swing low trong vòng 'max_close_back_candles' không
+        for (int i = 0; i < rates_to_copy; i++) {
+            // rates[i] là nến đang xét, bắt đầu từ nến sweep (check_bar_shift)
+            // và các nến sau đó (về phía hiện tại hơn nếu check_bar_shift > 0)
+            // Tuy nhiên, CopyRates lấy từ shift ngược về quá khứ.
+            // Nếu check_bar_shift = 1, max_close_back_candles = 2:
+            // rates[0] = nến 1 (nến sweep)
+            // rates[1] = nến 2 (nến trước nến sweep)
+            // Chúng ta muốn kiểm tra nến sweep và N nến *sau* nó (về phía hiện tại)
+            // Nên CopyRates phải lấy từ 0 (nến hiện tại) và lấy đủ số lượng.
+            // Hoặc, quét từng nến một.
+
+            // Cách tiếp cận đơn giản hơn: kiểm tra nến tại check_bar_shift và các nến sau đó (index nhỏ hơn)
+            // Lấy dữ liệu một lần cho tất cả các nến cần thiết
+            MqlRates candidate_rates[];
+            int total_candles_needed = check_bar_shift + max_close_back_candles; // Lấy dư ra
+            if(CopyRates(_Symbol, timeframe, 0, total_candles_needed, candidate_rates) < total_candles_needed) return false;
+            ArraySetAsSeries(candidate_rates, true); // candle_rates[0] là nến hiện tại, [1] là nến trước...
+
+            // candidate_rates[check_bar_shift] là nến thực hiện sweep
+            double sweep_low_price = candidate_rates[check_bar_shift].low;
+            double actual_spike_points = (prev_swing_low.low - sweep_low_price) / _Point;
+
+            if (sweep_low_price < prev_swing_low.low && (min_spike_points == 0 || actual_spike_points >= min_spike_points)) {
+                // Đã có spike xuống dưới. Giờ check đóng cửa
+                for (int k = 0; k < max_close_back_candles; k++) {
+                    int confirmation_candle_idx = check_bar_shift - k; // k=0 là nến sweep, k=1 là nến sau đó (về hiện tại)
+                    if (confirmation_candle_idx < 0) break; // Không đi quá nến hiện tại
+
+                    if (candidate_rates[confirmation_candle_idx].close > prev_swing_low.low) {
+                        sweep_candle_info.high = candidate_rates[check_bar_shift].high; // Thông tin của nến tạo sweep
+                        sweep_candle_info.low = candidate_rates[check_bar_shift].low;
+                        sweep_candle_info.bar_index = check_bar_shift; // Là shift của nến tạo sweep
+                        sweep_candle_info.isValid = true;
+                        // PrintFormat("Bullish Liquidity Sweep on %s. Swept SL at %G (bar %d). Sweep candle bar %d. Confirmed close back on bar %d",
+                        //             EnumToString(timeframe), prev_swing_low.low, prev_swing_low.bar_index, check_bar_shift, confirmation_candle_idx);
+                        return true;
+                    }
+                }
+            }
+            return false; // Nếu nến check_bar_shift không sweep thì không cần check thêm
+        }
+    }
+    return false; // Should not be reached if logic above is correct for single check_bar_shift sweep attempt.
+                  // The loop for 'i' was incorrect. We only check if 'check_bar_shift' candle is a sweep.
+}
+//+------------------------------------------------------------------+
+//| Check for a Bearish Liquidity Sweep (sweep of highs)           |
+//+------------------------------------------------------------------+
+bool CheckAndGetBearishLiquiditySweep(ENUM_TIMEFRAMES timeframe, const PriceZone &prev_swing_high,
+                                     double min_spike_points, int max_close_back_candles,
+                                     PriceZone &sweep_candle_info, int check_bar_shift = 1) {
+    sweep_candle_info.Reset();
+    if (!prev_swing_high.isValid) return false;
+
+    MqlRates candidate_rates[];
+    int total_candles_needed = check_bar_shift + max_close_back_candles;
+    if(CopyRates(_Symbol, timeframe, 0, total_candles_needed, candidate_rates) < total_candles_needed) return false;
+    ArraySetAsSeries(candidate_rates, true);
+
+    double sweep_high_price = candidate_rates[check_bar_shift].high;
+    double actual_spike_points = (sweep_high_price - prev_swing_high.high) / _Point;
+
+    if (sweep_high_price > prev_swing_high.high && (min_spike_points == 0 || actual_spike_points >= min_spike_points)) {
+        for (int k = 0; k < max_close_back_candles; k++) {
+            int confirmation_candle_idx = check_bar_shift - k;
+            if (confirmation_candle_idx < 0) break;
+
+            if (candidate_rates[confirmation_candle_idx].close < prev_swing_high.high) {
+                sweep_candle_info.high = candidate_rates[check_bar_shift].high;
+                sweep_candle_info.low = candidate_rates[check_bar_shift].low;
+                sweep_candle_info.bar_index = check_bar_shift;
+                sweep_candle_info.isValid = true;
+                // PrintFormat("Bearish Liquidity Sweep on %s. Swept SH at %G (bar %d). Sweep candle bar %d. Confirmed close back on bar %d",
+                //             EnumToString(timeframe), prev_swing_high.high, prev_swing_high.bar_index, check_bar_shift, confirmation_candle_idx);
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+//+------------------------------------------------------------------+
+//| Execute a buy setup if conditions are favorable                  |
+//+------------------------------------------------------------------+
+void ExecuteBuySetup(const PriceZone &currentBullishOB, const PriceZone &currentBullishFVG,
+                     const PriceZone &bullishSweepInfo, bool wasBullishSweep,
+                     bool wasBullishBOS, const PriceZone &bullishCHoCHLevelBroken, bool wasBullishCHoCH,
+                     const PriceZone &lastSignificantHighOnETF, const PriceZone &lastSignificantLowOnETF,
+                     ENUM_HTF_REACTION_CONTEXT htfContext, 
+                     const PriceZone &activeHTF_POI) {
+
+    if (currentBias == BIAS_BEARISH && !AllowTradingNeutralBias) return;
+
+    double entryPrice = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+    double stopLoss = 0;
+    bool sl_set_by_smc_factor = false;
+    bool entry_conditions_met = true; 
+
+    // --- KIỂM TRA YẾU TỐ XÁC NHẬN: ORDER BLOCK (OB) ---
+    if (entry_conditions_met && C_Entry_Require_OB_Touch) {
+        if (!currentBullishOB.isValid) {
+            Print("ExecuteBuySetup: OB touch required, but no valid Bullish OB.");
+            entry_conditions_met = false; 
+        } else {
+            if (!(entryPrice >= currentBullishOB.low && entryPrice <= currentBullishOB.high)) {
+                PrintFormat("ExecuteBuySetup: OB touch required. Ask %G is outside Bullish OB [%G - %G]",
+                            entryPrice, currentBullishOB.low, currentBullishOB.high);
+                entry_conditions_met = false; 
+            } else {
+                PrintFormat("ExecuteBuySetup: OB touch condition met. Ask %G in Bullish OB [%G - %G]",
+                            entryPrice, currentBullishOB.low, currentBullishOB.high);
+                stopLoss = currentBullishOB.low - SL_BufferPoints * _Point;
+                sl_set_by_smc_factor = true;
+            }
+        }
+    }
+
+    // --- KIỂM TRA YẾU TỐ XÁC NHẬN: FVG MITIGATION --- ADD THIS BLOCK ++++++
+    if (entry_conditions_met && C_Entry_Require_FVG_Mitigation) {
+        if (!currentBullishFVG.isValid) {
+            Print("ExecuteBuySetup: FVG mitigation required, but no valid Bullish FVG found.");
+            entry_conditions_met = false;
+        } else {
+            // Điều kiện "mitigation": Giá Ask phải nằm trong phạm vi FVG [FVG.low, FVG.high]
+            // Hoặc bạn có thể định nghĩa phức tạp hơn: giá đã chạm vào FVG và có nến phản ứng.
+            // Hiện tại: Ask phải nằm trong FVG để coi là đang "mitigate" và có thể vào lệnh.
+            if (!(entryPrice >= currentBullishFVG.low && entryPrice <= currentBullishFVG.high)) {
+                PrintFormat("ExecuteBuySetup: FVG mitigation required. Ask %G is outside Bullish FVG [%G - %G]",
+                            entryPrice, currentBullishFVG.low, currentBullishFVG.high);
+                entry_conditions_met = false;
+            } else {
+                PrintFormat("ExecuteBuySetup: FVG mitigation condition met. Ask %G in Bullish FVG [%G - %G]",
+                            entryPrice, currentBullishFVG.low, currentBullishFVG.high);
+                // Nếu OB không phải là yếu tố đặt SL hoặc không được yêu cầu, thì FVG sẽ đặt SL
+                if (!sl_set_by_smc_factor) { // Chỉ đặt SL bằng FVG nếu OB chưa đặt
+                    stopLoss = currentBullishFVG.low - SL_BufferPoints * _Point;
+                    sl_set_by_smc_factor = true;
+                } 
+                // Nếu cả OB và FVG đều được yêu cầu và SL đã được OB đặt, 
+                // bạn có thể thêm logic để chọn SL an toàn hơn (ví dụ: MathMin(sl_OB, sl_FVG))
+                // hoặc ưu tiên một yếu tố nào đó. Hiện tại, OB sẽ được ưu tiên nếu nó đặt SL trước.
+            }
+        }
+    }
+ if (entry_conditions_met && C_Entry_Require_Sweep_Occurred) {
+        if (!wasBullishSweep) { // Sử dụng biến bool đã được xác định trong AnalyzeAndTrade
+            Print("ExecuteBuySetup: Bullish Sweep required, but no recent sweep detected.");
+            entry_conditions_met = false;
+        } else {
+            PrintFormat("ExecuteBuySetup: Bullish Sweep condition met. Sweep candle bar shift: %d", bullishSweepInfo.bar_index);
+            // Logic đặt SL nếu Sweep là yếu tố chính (nếu OB và FVG không đặt)
+            if (!sl_set_by_smc_factor && bullishSweepInfo.isValid) {
+                stopLoss = bullishSweepInfo.low - SL_BufferPoints * _Point; // SL dưới râu nến sweep
+                sl_set_by_smc_factor = true;
+            }
+        }
+    }
+    
+    // --- KIỂM TRA YẾU TỐ XÁC NHẬN: FVG MITIGATION --- ADD THIS BLOCK ++++++
+    if (entry_conditions_met && C_Entry_Require_FVG_Mitigation) {
+        if (!currentBullishFVG.isValid) {
+            Print("ExecuteBuySetup: FVG mitigation required, but no valid Bullish FVG found.");
+            entry_conditions_met = false;
+        } else {
+            // Điều kiện "mitigation": Giá Ask phải nằm trong phạm vi FVG [FVG.low, FVG.high]
+            // Hoặc bạn có thể định nghĩa phức tạp hơn: giá đã chạm vào FVG và có nến phản ứng.
+            // Hiện tại: Ask phải nằm trong FVG để coi là đang "mitigate" và có thể vào lệnh.
+            if (!(entryPrice >= currentBullishFVG.low && entryPrice <= currentBullishFVG.high)) {
+                PrintFormat("ExecuteBuySetup: FVG mitigation required. Ask %G is outside Bullish FVG [%G - %G]",
+                            entryPrice, currentBullishFVG.low, currentBullishFVG.high);
+                entry_conditions_met = false;
+            } else {
+                PrintFormat("ExecuteBuySetup: FVG mitigation condition met. Ask %G in Bullish FVG [%G - %G]",
+                            entryPrice, currentBullishFVG.low, currentBullishFVG.high);
+                // Nếu OB không phải là yếu tố đặt SL hoặc không được yêu cầu, thì FVG sẽ đặt SL
+                if (!sl_set_by_smc_factor) { // Chỉ đặt SL bằng FVG nếu OB chưa đặt
+                    stopLoss = currentBullishFVG.low - SL_BufferPoints * _Point;
+                    sl_set_by_smc_factor = true;
+                } 
+                // Nếu cả OB và FVG đều được yêu cầu và SL đã được OB đặt, 
+                // bạn có thể thêm logic để chọn SL an toàn hơn (ví dụ: MathMin(sl_OB, sl_FVG))
+                // hoặc ưu tiên một yếu tố nào đó. Hiện tại, OB sẽ được ưu tiên nếu nó đặt SL trước.
+            }
+        }
+    }
+
+    // TODO: Thêm các khối 'if (entry_conditions_met && C_Entry_Require_XXX)' khác ở đây cho FVG, Sweep, BOS, CHoCH
+    // Mỗi khối sẽ kiểm tra input bool tương ứng và PriceZone được truyền vào (cần cập nhật tham số hàm ExecuteBuySetup)
+    // Nếu điều kiện không được đáp ứng, đặt entry_conditions_met = false;
+    // Nếu điều kiện được đáp ứng VÀ nó cung cấp một mức SL tốt hơn, cập nhật stopLoss và sl_set_by_smc_factor = true;
+
+    // Nếu bất kỳ điều kiện bắt buộc nào không được đáp ứng, không vào lệnh
+    if (!entry_conditions_met) {
+        Print("ExecuteBuySetup: Not all required entry conditions met.");
+        return;
+    }
+
+    // --- XÁC ĐỊNH STOP LOSS MẶC ĐỊNH (NẾU CHƯA ĐƯỢC ĐẶT BỞI YẾU TỐ SMC) ---
+    if (!sl_set_by_smc_factor) {
+        int swingLowBar = FindSwingLow(PERIOD_CURRENT, SwingLookback);
+        if (swingLowBar > 0 && iLow(_Symbol, PERIOD_CURRENT, swingLowBar) < entryPrice) { // Đảm bảo SL dưới entry
+            stopLoss = iLow(_Symbol, PERIOD_CURRENT, swingLowBar) - SL_BufferPoints * _Point;
+        } else {
+            // Nếu không có swing low hợp lệ hoặc swing low trên entry, dùng MinStopDistancePoints
+            stopLoss = entryPrice - MinStopDistancePoints * _Point;
+        }
+    }
+
+    // Đảm bảo SL luôn tôn trọng MinStopDistancePoints và nằm dưới entryPrice
+    if (entryPrice - stopLoss < MinStopDistancePoints * _Point) {
+        stopLoss = entryPrice - MinStopDistancePoints * _Point;
+    }
+    if (stopLoss >= entryPrice) { // Kiểm tra cuối cùng, SL phải dưới entry
+         PrintFormat("ExecuteBuySetup: Invalid SL (%G) calculated relative to Entry (%G). MinStop: %d. Skipping trade.", 
+                    stopLoss, entryPrice, MinStopDistancePoints);
+         return;
+    }
+
+    // --- Tính toán Take Profit ---
+    double stopDistance = entryPrice - stopLoss;
+    if (stopDistance <= 0) { // Kiểm tra lại stopDistance sau tất cả các điều chỉnh
+         PrintFormat("ExecuteBuySetup: Invalid stop distance (%G points). Skipping trade.", stopDistance/_Point);
+         return;
+    }
+    double takeProfit = entryPrice + (stopDistance * RRRatio);
+
+    // --- KIỂM TRA CUỐI CÙNG TRƯỚC KHI VÀO LỆNH (VALIDATE LEVELS) ---
+    if (stopLoss <= 0 || takeProfit <= entryPrice) { // SL phải > 0, TP phải > entry
+        PrintFormat("ExecuteBuySetup: Invalid SL/TP. SL=%G, TP=%G, Entry=%G. Skipping trade.",
+                    stopLoss, takeProfit, entryPrice);
+        return;
+    }
+
+    // Calculate lot size
+    double lotSize = CalculateLotSize(stopDistance);
+
+    // Execute trade
+    if (lotSize > 0) {
+        bool result = trade.Buy(lotSize, _Symbol, entryPrice, stopLoss, takeProfit, "SMC BUY"); // Truyền entryPrice
+        if (result) {
+            PrintFormat("BUY executed: Lot=%.2f, Entry=%.*f, SL=%.*f, TP=%.*f",
+                        lotSize, _Digits, entryPrice, _Digits, stopLoss, _Digits, takeProfit);
+        } else {
+            PrintFormat("Failed to execute BUY trade: %s, Error code: %d",
+                        trade.ResultComment(), trade.ResultRetcode());
+        }
+    }
+}
+//+------------------------------------------------------------------+
+//| Draw a PriceZone object as an Order Block on the chart           |
+//+------------------------------------------------------------------+
+void DrawOrderBlock(const PriceZone &zone, color ob_color, string ob_name_prefix, ENUM_TIMEFRAMES timeframe,
+                    ENUM_LINE_STYLE style, int width, bool fill, int extend_bars) {
+    if (!zone.isValid) {
+        return;
+    }
+
+    // Tạo tên đối tượng gần như duy nhất, bao gồm timeframe để tránh xung đột khi vẽ trên nhiều timeframe
+    string obj_name = StringFormat("%s_%s_%s_bar%d_H%.5f_L%.5f",
+                                  ob_name_prefix,
+                                  _Symbol,
+                                  EnumToString(timeframe), // Thêm timeframe vào tên
+                                  zone.bar_index,
+                                  zone.high,
+                                  zone.low
+                                  );
+    obj_name = StringSubstr(obj_name,0,62); // Giới hạn độ dài tên object là 63 ký tự
+
+    datetime time_ob_candle_open = iTime(_Symbol, timeframe, zone.bar_index); // Thời gian mở cửa của nến OB
+    datetime rect_time_left, rect_time_right;
+
+    // Cạnh trái của hình chữ nhật sẽ là thời gian mở cửa của nến OB
+    rect_time_right = time_ob_candle_open;
+
+    // Cạnh phải của hình chữ nhật
+    if (extend_bars <= 0) { // Chỉ vẽ trên nến OB
+        rect_time_left = iTime(_Symbol, timeframe, zone.bar_index - 1);
+    } else {
+        // Kéo dài N thanh KỂ TỪ SAU NẾN OB.
+        // zone.bar_index là nến OB. (zone.bar_index - 1) là nến ngay sau đó (về phía hiện tại).
+        // Cạnh phải sẽ ở vị trí của nến (zone.bar_index - 1 - (extend_bars -1))
+        // Hoặc đơn giản là zone.bar_index - extend_bars
+        int end_bar_plot_idx = MathMax(0, zone.bar_index - extend_bars); // Điểm cuối cùng để vẽ tới (index)
+        rect_time_left = iTime(_Symbol, timeframe, end_bar_plot_idx);
+    }
+    
+    // Đảm bảo rect_time_left < rect_time_right cho ObjectCreate
+    if(rect_time_left > rect_time_right) {
+        datetime temp = rect_time_left;
+        rect_time_left = rect_time_right;
+        rect_time_right = temp;
+    }
+
+
+    ObjectDelete(0, obj_name);
+
+    if (ObjectCreate(0, obj_name, OBJ_RECTANGLE, 0, rect_time_left, zone.low, rect_time_right, zone.high)) {
+        ObjectSetInteger(0, obj_name, OBJPROP_COLOR, ob_color);
+        ObjectSetInteger(0, obj_name, OBJPROP_STYLE, style);
+        ObjectSetInteger(0, obj_name, OBJPROP_WIDTH, width);
+        ObjectSetInteger(0, obj_name, OBJPROP_BACK, true);
+        ObjectSetInteger(0, obj_name, OBJPROP_FILL, fill);
+        ObjectSetString(0, obj_name, OBJPROP_TOOLTIP, StringFormat("%s\nBar Time: %s\nHigh: %.5f\nLow: %.5f", // Sử dụng %.5f cho giá
+                                                                  ob_name_prefix,
+                                                                  TimeToString(time_ob_candle_open, TIME_MINUTES|TIME_DATE),
+                                                                  zone.high,
+                                                                  zone.low));
+    } else {
+        PrintFormat("Error creating/updating Order Block object: %s, Error code: %d ChartID: %d", obj_name, GetLastError(), ChartID());
+    }
+}
+//+------------------------------------------------------------------+
+//| Draw a PriceZone object as a Fair Value Gap on the chart         |
+//+------------------------------------------------------------------+
+void DrawFairValueGap(const PriceZone &zone, color fvg_color, string fvg_name_prefix, ENUM_TIMEFRAMES timeframe,
+                      ENUM_LINE_STYLE style, int width, bool fill, int extend_bars) {
+    if (!zone.isValid) {
+        return;
+    }
+
+    // bar_index của FVG là index của nến thứ 2 (nến giữa)
+    string obj_name = StringFormat("%s_%s_%s_bar%d_H%.5f_L%.5f",
+                                  fvg_name_prefix,
+                                  _Symbol,
+                                  EnumToString(timeframe),
+                                  zone.bar_index, // Index của nến giữa FVG
+                                  zone.high,
+                                  zone.low
+                                  );
+    obj_name = StringSubstr(obj_name,0,62);
+
+    // FVG được hình thành trên nến zone.bar_index (nến thứ 2)
+    // Hình chữ nhật sẽ bắt đầu từ thời gian mở cửa của nến zone.bar_index
+    datetime time_fvg_candle_open = iTime(_Symbol, timeframe, zone.bar_index);
+    datetime rect_time_left, rect_time_right;
+
+    rect_time_right = time_fvg_candle_open; // Cạnh trái của hình chữ nhật sẽ là thời gian của nến giữa FVG
+
+    if (extend_bars <= 0) { // Chỉ vẽ trên phạm vi nến giữa FVG
+        rect_time_left = iTime(_Symbol, timeframe, zone.bar_index - 1); // Cạnh phải sẽ là cuối nến giữa FVG
+    } else {
+        // Kéo dài về phía tương lai (sang phải trên biểu đồ)
+        // Cạnh phải sẽ là thời gian của nến (zone.bar_index - extend_bars)
+        int end_bar_plot_idx = MathMax(0, zone.bar_index - extend_bars);
+        rect_time_left = iTime(_Symbol, timeframe, end_bar_plot_idx);
+    }
+    
+    // Đảm bảo rect_time_left < rect_time_right
+    if(rect_time_left > rect_time_right) {
+        datetime temp = rect_time_left;
+        rect_time_left = rect_time_right;
+        rect_time_right = temp;
+    }
+
+
+    ObjectDelete(0, obj_name);
+
+    if (ObjectCreate(0, obj_name, OBJ_RECTANGLE, 0, rect_time_left, zone.low, rect_time_right, zone.high)) {
+        ObjectSetInteger(0, obj_name, OBJPROP_COLOR, fvg_color);
+        ObjectSetInteger(0, obj_name, OBJPROP_STYLE, style);
+        ObjectSetInteger(0, obj_name, OBJPROP_WIDTH, width);
+        ObjectSetInteger(0, obj_name, OBJPROP_BACK, true);
+        ObjectSetInteger(0, obj_name, OBJPROP_FILL, fill);
+        ObjectSetString(0, obj_name, OBJPROP_TOOLTIP, StringFormat("%s (on bar %s)\nTop: %.5f\nBottom: %.5f",
+                                                                  fvg_name_prefix,
+                                                                  TimeToString(time_fvg_candle_open, TIME_MINUTES|TIME_DATE),
+                                                                  zone.high, // Với FVG, high là cạnh trên, low là cạnh dưới
+                                                                  zone.low));
+    } else {
+        PrintFormat("Error creating/updating FVG object: %s, Error code: %d ChartID: %d", obj_name, GetLastError(), ChartID());
+    }
+}
+//+------------------------------------------------------------------+
+//| Draw a marker for a liquidity sweep event                      |
+//+------------------------------------------------------------------+
+void DrawLiquiditySweepMarker(ENUM_TIMEFRAMES timeframe,
+                              const PriceZone &sweep_candle_info, // Thông tin về nến thực hiện sweep
+                              const PriceZone &swept_level_info,  // Thông tin về mức swing bị quét
+                              bool is_bullish_sweep,             // True nếu là bullish sweep (quét đáy), false nếu là bearish sweep (quét đỉnh)
+                              color sweep_color,
+                              int arrow_code) {
+    if (!sweep_candle_info.isValid || !swept_level_info.isValid) {
+        return;
+    }
+
+    // Tạo tên đối tượng duy nhất
+    string obj_name = StringFormat("SMC_LS_%s_%s_%s_bar%d_swept%d",
+                                  (is_bullish_sweep ? "Bull" : "Bear"),
+                                  _Symbol,
+                                  EnumToString(timeframe),
+                                  sweep_candle_info.bar_index, // bar_index của nến sweep
+                                  swept_level_info.bar_index); // bar_index của mức bị quét
+    obj_name = StringSubstr(obj_name,0,62);
+
+    datetime sweep_time = iTime(_Symbol, timeframe, sweep_candle_info.bar_index);
+    double sweep_price;
+    double y_offset = SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 200; // Khoảng cách đặt mũi tên so với râu nến
+
+    if (is_bullish_sweep) { // Bullish sweep - quét đáy, đặt mũi tên dưới râu dưới của nến sweep
+        sweep_price = sweep_candle_info.low - y_offset;
+    } else { // Bearish sweep - quét đỉnh, đặt mũi tên trên râu trên của nến sweep
+        sweep_price = sweep_candle_info.high + y_offset;
+    }
+
+    ObjectDelete(0, obj_name); // Xóa đối tượng cũ nếu có (để cập nhật)
+
+    if (ObjectCreate(0, obj_name, OBJ_ARROW, 0, sweep_time, sweep_price)) {
+        ObjectSetInteger(0, obj_name, OBJPROP_ARROWCODE, arrow_code);
+        ObjectSetInteger(0, obj_name, OBJPROP_COLOR, sweep_color);
+        ObjectSetInteger(0, obj_name, OBJPROP_WIDTH, 1);
+        ObjectSetInteger(0, obj_name, OBJPROP_BACK, false); // Để mũi tên nổi lên trên
+        ObjectSetString(0, obj_name, OBJPROP_TOOLTIP, StringFormat("%s Liquidity Sweep\nSwept Level: %s\nSweep Candle: %s",
+                                                                  (is_bullish_sweep ? "Bullish" : "Bearish"),
+                                                                  (is_bullish_sweep ? DoubleToString(swept_level_info.low, _Digits) : DoubleToString(swept_level_info.high, _Digits)),
+                                                                  TimeToString(sweep_time, TIME_MINUTES|TIME_DATE)
+                                                                  ));
+    } else {
+        PrintFormat("Error creating Liquidity Sweep Marker object: %s, Error: %d", obj_name, GetLastError());
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Execute a sell setup if conditions are favorable                 |
+//+------------------------------------------------------------------+
+void ExecuteSellSetup(const PriceZone &currentBearishOB, const PriceZone &currentBearishFVG,
+                      const PriceZone &bearishSweepInfo, bool wasBearishSweep,
+                      bool wasBearishBOS, const PriceZone &bearishCHoCHLevelBroken, bool wasBearishCHoCH,
+                      const PriceZone &lastSignificantHighOnETF, const PriceZone &lastSignificantLowOnETF,
+                      ENUM_HTF_REACTION_CONTEXT htfContext,
+                      const PriceZone &activeHTF_POI) {
+
+    if (currentBias == BIAS_BULLISH && !AllowTradingNeutralBias) return;
+
+    double entryPrice = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+    double stopLoss = 0;
+    bool sl_set_by_smc_factor = false;
+    bool entry_conditions_met = true;
+
+    // --- KIỂM TRA CÁC YẾU TỐ XÁC NHẬN (CONFLUENCE FACTORS) ---
+
+    // 1. ORDER BLOCK (OB)
+    if (entry_conditions_met && C_Entry_Require_OB_Touch) {
+        if (!currentBearishOB.isValid) {
+            Print("ExecuteSellSetup: OB touch required, but no valid Bearish OB found.");
+            entry_conditions_met = false;
+        } else {
+            if (!(entryPrice <= currentBearishOB.high && entryPrice >= currentBearishOB.low)) {
+                PrintFormat("ExecuteSellSetup: OB touch required. Bid %G is outside Bearish OB [%G - %G]",
+                            entryPrice, currentBearishOB.low, currentBearishOB.high);
+                entry_conditions_met = false;
+            } else {
+                PrintFormat("ExecuteSellSetup: OB touch condition met. Bid %G in Bearish OB [%G - %G]",
+                            entryPrice, currentBearishOB.low, currentBearishOB.high);
+                stopLoss = currentBearishOB.high + SL_BufferPoints * _Point;
+                sl_set_by_smc_factor = true;
+            }
+        }
+    }
+
+    // 2. FVG MITIGATION
+    if (entry_conditions_met && C_Entry_Require_FVG_Mitigation) {
+        if (!currentBearishFVG.isValid) {
+            Print("ExecuteSellSetup: FVG mitigation required, but no valid Bearish FVG found.");
+            entry_conditions_met = false;
+        } else {
+            if (!(entryPrice <= currentBearishFVG.high && entryPrice >= currentBearishFVG.low)) {
+                PrintFormat("ExecuteSellSetup: FVG mitigation required. Bid %G is outside Bearish FVG [%G - %G]",
+                            entryPrice, currentBearishFVG.low, currentBearishFVG.high);
+                entry_conditions_met = false;
+            } else {
+                PrintFormat("ExecuteSellSetup: FVG mitigation condition met. Bid %G in Bearish FVG [%G - %G]",
+                            entryPrice, currentBearishFVG.low, currentBearishFVG.high);
+                if (!sl_set_by_smc_factor) { // Chỉ đặt SL bằng FVG nếu OB chưa đặt
+                    stopLoss = currentBearishFVG.high + SL_BufferPoints * _Point;
+                    sl_set_by_smc_factor = true;
+                }
+            }
+        }
+    }
+    
+    // 3. LIQUIDITY SWEEP ++++++++++++++++++++++++++++++++++++++++++++++++++++++
+    if (entry_conditions_met && C_Entry_Require_Sweep_Occurred) {
+        if (!wasBearishSweep) { // Sử dụng biến bool đã được xác định trong AnalyzeAndTrade
+            Print("ExecuteSellSetup: Bearish Sweep required, but no recent sweep detected.");
+            entry_conditions_met = false;
+        } else {
+            PrintFormat("ExecuteSellSetup: Bearish Sweep condition met. Sweep candle bar shift: %d", bearishSweepInfo.bar_index);
+            // Logic đặt SL nếu Sweep là yếu tố chính (nếu OB và FVG không đặt hoặc SL này an toàn hơn)
+            if (!sl_set_by_smc_factor && bearishSweepInfo.isValid) {
+                stopLoss = bearishSweepInfo.high + SL_BufferPoints * _Point; // SL trên râu nến sweep
+                sl_set_by_smc_factor = true;
+            }
+            // Bạn có thể thêm logic so sánh nếu muốn chọn SL tối ưu nhất nếu nhiều điều kiện cùng được kích hoạt
+            // Ví dụ: if (bearishSweepInfo.isValid && (bearishSweepInfo.high + SL_BufferPoints * _Point > stopLoss || !sl_set_by_smc_factor)) { ... }
+        }
+    }
+    // TODO: Thêm các khối kiểm tra cho C_Entry_Require_BOS_Confirmation và C_Entry_Require_CHoCH_Signal ở đây
+    // (Sử dụng các tham số wasBearishBOS, bearishCHoCHLevelBroken, wasBearishCHoCH)
+
+
+    // --- KIỂM TRA YẾU TỐ XÁC NHẬN: FVG MITIGATION --- ADD THIS BLOCK ++++++
+    if (entry_conditions_met && C_Entry_Require_FVG_Mitigation) {
+        if (!currentBearishFVG.isValid) {
+            Print("ExecuteSellSetup: FVG mitigation required, but no valid Bearish FVG found.");
+            entry_conditions_met = false;
+        } else {
+            if (!(entryPrice <= currentBearishFVG.high && entryPrice >= currentBearishFVG.low)) {
+                PrintFormat("ExecuteSellSetup: FVG mitigation required. Bid %G is outside Bearish FVG [%G - %G]",
+                            entryPrice, currentBearishFVG.low, currentBearishFVG.high);
+                entry_conditions_met = false;
+            } else {
+                PrintFormat("ExecuteSellSetup: FVG mitigation condition met. Bid %G in Bearish FVG [%G - %G]",
+                            entryPrice, currentBearishFVG.low, currentBearishFVG.high);
+                if (!sl_set_by_smc_factor) {
+                    stopLoss = currentBearishFVG.high + SL_BufferPoints * _Point;
+                    sl_set_by_smc_factor = true;
+                }
+            }
+        }
+    }
+
+    // TODO: Thêm các khối 'if (entry_conditions_met && C_Entry_Require_XXX)' khác ở đây
+
+    if (!entry_conditions_met) {
+        Print("ExecuteSellSetup: Not all required entry conditions met.");
+        return;
+    }
+
+    // --- XÁC ĐỊNH STOP LOSS MẶC ĐỊNH ---
+    if (!sl_set_by_smc_factor) {
+        int swingHighBar = FindSwingHigh(PERIOD_CURRENT, SwingLookback);
+        if (swingHighBar > 0 && iHigh(_Symbol, PERIOD_CURRENT, swingHighBar) > entryPrice) { // Đảm bảo SL trên entry
+            stopLoss = iHigh(_Symbol, PERIOD_CURRENT, swingHighBar) + SL_BufferPoints * _Point;
+        } else {
+            stopLoss = entryPrice + MinStopDistancePoints * _Point;
+        }
+    }
+
+    if (stopLoss - entryPrice < MinStopDistancePoints * _Point) {
+        stopLoss = entryPrice + MinStopDistancePoints * _Point;
+    }
+     if (stopLoss <= entryPrice) { // SL phải trên entry
+         PrintFormat("ExecuteSellSetup: Invalid SL (%G) calculated relative to Entry (%G). MinStop: %d. Skipping trade.", 
+                    stopLoss, entryPrice, MinStopDistancePoints);
+         return;
+    }
+
+
+    // --- Tính toán Take Profit ---
+    double stopDistance = stopLoss - entryPrice;
+     if (stopDistance <= 0) {
+         PrintFormat("ExecuteSellSetup: Invalid stop distance (%G points). Skipping trade.", stopDistance/_Point);
+         return;
+    }
+    double takeProfit = entryPrice - (stopDistance * RRRatio);
+
+    // --- KIỂM TRA CUỐI CÙNG ---
+    if (stopLoss <= 0 || takeProfit >= entryPrice || takeProfit <=0 ) { // SL, TP phải > 0, TP phải < entry
+         PrintFormat("ExecuteSellSetup: Invalid SL/TP. SL=%G, TP=%G, Entry=%G. Skipping trade.",
+                    stopLoss, takeProfit, entryPrice);
+        return;
+    }
+
+    double lotSize = CalculateLotSize(stopDistance);
+
+    if (lotSize > 0) {
+        bool result = trade.Sell(lotSize, _Symbol, entryPrice, stopLoss, takeProfit, "SMC SELL");
+        if (result) {
+            PrintFormat("SELL executed: Lot=%.2f, Entry=%.*f, SL=%.*f, TP=%.*f",
+                        lotSize, _Digits, entryPrice, _Digits, stopLoss, _Digits, takeProfit);
+        } else {
+            PrintFormat("Failed to execute SELL trade: %s, Error code: %d",
+                        trade.ResultComment(), trade.ResultRetcode());
+        }
+    }
+}
+//+------------------------------------------------------------------+
+//| Find a recent swing low                                          |
+//+------------------------------------------------------------------+
+int FindSwingLow(ENUM_TIMEFRAMES timeframe, int lookback) {
+   for (int i = 2; i < lookback; i++) {
+      if (iLow(_Symbol, timeframe, i) < iLow(_Symbol, timeframe, i-1) && 
+          iLow(_Symbol, timeframe, i) < iLow(_Symbol, timeframe, i+1)) {
+         return i;
+      }
+   }
+   return -1;
+}
+
+//+------------------------------------------------------------------+
+//| Find a recent swing high                                         |
+//+------------------------------------------------------------------+
+int FindSwingHigh(ENUM_TIMEFRAMES timeframe, int lookback) {
+   for (int i = 2; i < lookback; i++) {
+      if (iHigh(_Symbol, timeframe, i) > iHigh(_Symbol, timeframe, i-1) && 
+          iHigh(_Symbol, timeframe, i) > iHigh(_Symbol, timeframe, i+1)) {
+         return i;
+      }
+   }
+   return -1;
+}
+
+//+------------------------------------------------------------------+
+//| Calculate position size based on risk                            |
+//+------------------------------------------------------------------+
+double CalculateLotSize(double stopDistance) {
+   if (stopDistance <= 0) {
+      Print("Invalid stop distance for lot calculation");
+      return 0.01; // Minimum lot size
+   }
+   
+   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double riskAmount = balance * RiskPercentage / 100.0;
+   
+   // Calculate value of 1 lot with this stop distance
+   double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double pointsPerLot = stopDistance / _Point;
+   double valuePerLot = pointsPerLot * tickValue / tickSize * _Point;
+   
+   // Calculate lot size based on risk
+   double lotSize = riskAmount / valuePerLot;
+   
+   // Normalize lot size
+   lotSize = NormalizeLotSize(lotSize);
+   
+   Print("Calculated lot size: ", DoubleToString(lotSize, 2), 
+         " (Risk: ", DoubleToString(riskAmount, 2), 
+         ", Stop Distance: ", DoubleToString(stopDistance, _Digits), ")");
+   
+   return lotSize;
+}
+
+//+------------------------------------------------------------------+
+//| Normalize lot size                                               |
+//+------------------------------------------------------------------+
+double NormalizeLotSize(double lotSize) {
+   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double stepLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   
+   // Ensure lot size is a multiple of step
+   lotSize = MathRound(lotSize / stepLot) * stepLot;
+   
+   // Ensure lot size is within allowed range
+   lotSize = MathMax(minLot, MathMin(maxLot, lotSize));
+   
+   return lotSize;
+}
