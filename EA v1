@@ -858,19 +858,19 @@ void LoadPersistentData() {
 //+------------------------------------------------------------------+
 PriceZone FindBullishOrderBlock(ENUM_TIMEFRAMES timeframe, int ob_lookback_period, double min_move_factor, int min_impulse_candles, int shift) {
     PriceZone ob;
-    MqlRates rates[];
-    ArraySetAsSeries(rates, true);
+    MqlRates localRates[];
+    ArraySetAsSeries(localRates, true);
 
     int rates_to_copy = ob_lookback_period + min_impulse_candles + shift + 5; 
-    if (CopyRates(_Symbol, timeframe, shift, rates_to_copy, rates) < rates_to_copy) {
+    if (CopyRates(_Symbol, timeframe, shift, rates_to_copy, localRates) < rates_to_copy) {
         PrintFormat("Error copying rates for Bullish OB detection on %s: %d", EnumToString(timeframe), GetLastError());
         return ob;
     }
 
     for (int i = min_impulse_candles; i < ob_lookback_period + min_impulse_candles; i++) {
-        if (i >= ArraySize(rates) -1) break; 
+        if (i >= ArraySize(localRates) -1) break; 
 
-        if (rates[i].close < rates[i].open) { 
+        if (localRates[i].close < localRates[i].open) { 
             bool strong_bullish_move = true;
             double total_impulse_move_range = 0;
             double highest_high_after_ob = 0;
@@ -881,23 +881,23 @@ PriceZone FindBullishOrderBlock(ENUM_TIMEFRAMES timeframe, int ob_lookback_perio
                     strong_bullish_move = false; 
                     break;
                 }
-                if (rates[impulse_candle_idx].close <= rates[impulse_candle_idx].open) {
+                if (localRates[impulse_candle_idx].close <= localRates[impulse_candle_idx].open) {
                     strong_bullish_move = false;
                     break;
                 }
-                if (rates[impulse_candle_idx].high > highest_high_after_ob) {
-                    highest_high_after_ob = rates[impulse_candle_idx].high;
+                if (localRates[impulse_candle_idx].high > highest_high_after_ob) {
+                    highest_high_after_ob = localRates[impulse_candle_idx].high;
                 }
-                total_impulse_move_range += (rates[impulse_candle_idx].high - rates[impulse_candle_idx].low);
+                total_impulse_move_range += (localRates[impulse_candle_idx].high - localRates[impulse_candle_idx].low);
             }
             
             if (!strong_bullish_move) continue;
 
-            double ob_candle_body = rates[i].open - rates[i].close;
-            if (highest_high_after_ob > rates[i].high && total_impulse_move_range >= ob_candle_body * min_move_factor) {
-                ob.high = rates[i].high;
-                ob.low = rates[i].low;
-                ob.bar_index = (int)iBarShift(_Symbol, timeframe, rates[i].time); 
+            double ob_candle_body = localRates[i].open - localRates[i].close;
+            if (highest_high_after_ob > localRates[i].high && total_impulse_move_range >= ob_candle_body * min_move_factor) {
+                ob.high = localRates[i].high;
+                ob.low = localRates[i].low;
+                ob.bar_index = (int)iBarShift(_Symbol, timeframe, localRates[i].time); 
                 ob.isValid = true;
                 return ob; 
             }
@@ -908,24 +908,24 @@ PriceZone FindBullishOrderBlock(ENUM_TIMEFRAMES timeframe, int ob_lookback_perio
 
 PriceZone FindBearishOrderBlock(ENUM_TIMEFRAMES timeframe, int ob_lookback_period, double min_move_factor, int min_impulse_candles, int shift) {
     PriceZone ob;
-    MqlRates rates[];
-    ArraySetAsSeries(rates, true);
+    MqlRates localRates[];
+    ArraySetAsSeries(localRates, true);
 
     int rates_to_copy = ob_lookback_period + min_impulse_candles + shift + 5;
-    if (CopyRates(_Symbol, timeframe, shift, rates_to_copy, rates) < rates_to_copy) {
+    if (CopyRates(_Symbol, timeframe, shift, rates_to_copy, localRates) < rates_to_copy) {
         PrintFormat("Error copying rates for Bearish OB detection on %s: %d", EnumToString(timeframe), GetLastError());
         return ob;
     }
 
     for (int i = min_impulse_candles; i < ob_lookback_period + min_impulse_candles; i++) {
-        if (i >= ArraySize(rates)-1) break;
+        if (i >= ArraySize(localRates)-1) break;
 
-        if (rates[i].close > rates[i].open) { 
+        if (localRates[i].close > localRates[i].open) { 
             bool strong_bearish_move = true;
             double total_impulse_move_range = 0;
-            double lowest_low_after_ob = rates[0].low;
-            if (ArraySize(rates) > 0 && min_impulse_candles > 0 && (i-1) >=0 ) {
-                lowest_low_after_ob = rates[i-1].low;
+            double lowest_low_after_ob = localRates[0].low;
+            if (ArraySize(localRates) > 0 && min_impulse_candles > 0 && (i-1) >=0 ) {
+                lowest_low_after_ob = localRates[i-1].low;
             }
 
             for(int k=0; k < min_impulse_candles; k++) {
@@ -934,23 +934,23 @@ PriceZone FindBearishOrderBlock(ENUM_TIMEFRAMES timeframe, int ob_lookback_perio
                     strong_bearish_move = false; 
                     break;
                 }
-                if (rates[impulse_candle_idx].close >= rates[impulse_candle_idx].open) {
+                if (localRates[impulse_candle_idx].close >= localRates[impulse_candle_idx].open) {
                     strong_bearish_move = false;
                     break;
                 }
-                if (rates[impulse_candle_idx].low < lowest_low_after_ob) {
-                    lowest_low_after_ob = rates[impulse_candle_idx].low;
+                if (localRates[impulse_candle_idx].low < lowest_low_after_ob) {
+                    lowest_low_after_ob = localRates[impulse_candle_idx].low;
                 }
-                total_impulse_move_range += (rates[impulse_candle_idx].high - rates[impulse_candle_idx].low);
+                total_impulse_move_range += (localRates[impulse_candle_idx].high - localRates[impulse_candle_idx].low);
             }
 
             if (!strong_bearish_move) continue;
 
-            double ob_candle_body = rates[i].close - rates[i].open;
-            if (lowest_low_after_ob < rates[i].low && total_impulse_move_range >= ob_candle_body * min_move_factor) {
-                ob.high = rates[i].high;
-                ob.low = rates[i].low;
-                ob.bar_index = (int)iBarShift(_Symbol, timeframe, rates[i].time);
+            double ob_candle_body = localRates[i].close - localRates[i].open;
+            if (lowest_low_after_ob < localRates[i].low && total_impulse_move_range >= ob_candle_body * min_move_factor) {
+                ob.high = localRates[i].high;
+                ob.low = localRates[i].low;
+                ob.bar_index = (int)iBarShift(_Symbol, timeframe, localRates[i].time);
                 ob.isValid = true;
                 return ob; 
             }
@@ -961,23 +961,23 @@ PriceZone FindBearishOrderBlock(ENUM_TIMEFRAMES timeframe, int ob_lookback_perio
 
 PriceZone FindBullishFVG(ENUM_TIMEFRAMES timeframe, int fvg_lookback_period, double min_fvg_size_points, int shift) {
     PriceZone fvg;
-    MqlRates rates[];
-    ArraySetAsSeries(rates, true);
+    MqlRates localRates[];
+    ArraySetAsSeries(localRates, true);
 
     int rates_to_copy = fvg_lookback_period + 3 + shift;
-    if (CopyRates(_Symbol, timeframe, shift, rates_to_copy, rates) < rates_to_copy) {
+    if (CopyRates(_Symbol, timeframe, shift, rates_to_copy, localRates) < rates_to_copy) {
         PrintFormat("Error copying rates for Bullish FVG detection on %s: %d", EnumToString(timeframe), GetLastError());
         return fvg;
     }
 
     for (int i = 0; i < fvg_lookback_period; i++) {
-        if (i + 2 >= ArraySize(rates)) {
+        if (i + 2 >= ArraySize(localRates)) {
             break; 
         }
 
-        MqlRates candle3 = rates[i];
-        MqlRates candle2 = rates[i+1];
-        MqlRates candle1 = rates[i+2];
+        MqlRates candle3 = localRates[i];
+        MqlRates candle2 = localRates[i+1];
+        MqlRates candle1 = localRates[i+2];
 
         if (candle3.low > candle1.high) {
             double fvg_size_actual = (candle3.low - candle1.high) / _Point; 
@@ -998,27 +998,26 @@ PriceZone FindBullishFVG(ENUM_TIMEFRAMES timeframe, int fvg_lookback_period, dou
 
 PriceZone FindBearishFVG(ENUM_TIMEFRAMES timeframe, int fvg_lookback_period, double min_fvg_size_points, int shift) {
     PriceZone fvg;
-    MqlRates rates[];
-    ArraySetAsSeries(rates, true);
+    MqlRates localRates[];
+    ArraySetAsSeries(localRates, true);
 
     int rates_to_copy = fvg_lookback_period + 3 + shift;
-    if (CopyRates(_Symbol, timeframe, shift, rates_to_copy, rates) < rates_to_copy) {
-        PrintFormat("Error copying rates for Bearish FVG detection on %s: %d", 
-                   EnumToString(timeframe), GetLastError());
+    if (CopyRates(_Symbol, timeframe, shift, rates_to_copy, localRates) < rates_to_copy) {
+        PrintFormat("Error copying rates for Bearish FVG detection on %s: %d", EnumToString(timeframe), GetLastError());
         return fvg;
     }
 
     for (int i = 0; i < fvg_lookback_period; i++) {
-        if (i + 2 >= ArraySize(rates)) {
-            break;
+        if (i + 2 >= ArraySize(localRates)) {
+            break; 
         }
 
-        MqlRates candle3 = rates[i];
-        MqlRates candle2 = rates[i+1];
-        MqlRates candle1 = rates[i+2];
+        MqlRates candle3 = localRates[i];
+        MqlRates candle2 = localRates[i+1];
+        MqlRates candle1 = localRates[i+2];
 
         if (candle3.high < candle1.low) {
-            double fvg_size_actual = (candle1.low - candle3.high) / _Point;
+            double fvg_size_actual = (candle1.low - candle3.high) / _Point; 
 
             if (min_fvg_size_points > 0 && fvg_size_actual < min_fvg_size_points) {
                 continue;
